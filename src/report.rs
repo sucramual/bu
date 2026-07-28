@@ -214,10 +214,10 @@ fn verify_recycle(
         .current_branch(&bench.path)
         .map_err(|error| error.to_string())?
     {
-        CurrentBranch::Attached(branch) if branch == bench.standin_branch => {}
-        CurrentBranch::Attached(branch) => {
+        CurrentBranch::Attached { name, .. } if name == bench.standin_branch => {}
+        CurrentBranch::Attached { name, .. } => {
             return Err(format!(
-                "worktree is on {branch}, not {}",
+                "worktree is on {name}, not {}",
                 bench.standin_branch
             ));
         }
@@ -285,10 +285,10 @@ fn observe(
         (
             WorktreeState::Clean,
             OperationState::Normal,
-            CurrentBranch::Attached(branch),
+            CurrentBranch::Attached { name, .. },
             StandinState::Ready { .. },
         ) => github
-            .pull_requests(&config.repository.path, branch)
+            .pull_requests(&config.repository.path, name)
             .map_err(|error| error.to_string())?,
         _ => PullRequestState::NotChecked,
     };
@@ -367,6 +367,7 @@ fn format_skip_reason(reason: &SkipReason) -> String {
     match reason {
         SkipReason::DirtyWorktree => "worktree is dirty".to_owned(),
         SkipReason::DetachedHead => "HEAD is detached".to_owned(),
+        SkipReason::AlreadyOnStandin => "already on the stand-in branch".to_owned(),
         SkipReason::OperationInProgress(operations) => format!(
             "Git operation in progress: {}",
             operations

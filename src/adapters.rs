@@ -95,7 +95,9 @@ impl GitAdapter {
             &arguments(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
         )?;
         if output.success {
-            return Ok(CurrentBranch::Attached(output.stdout.trim().to_owned()));
+            let name = output.stdout.trim().to_owned();
+            let commit = self.ref_commit(bench, "HEAD")?;
+            return Ok(CurrentBranch::Attached { name, commit });
         }
         if output.status == "1" {
             return Ok(CurrentBranch::Detached);
@@ -345,7 +347,7 @@ impl GitHubAdapter {
                 "--head",
                 branch,
                 "--json",
-                "number,state,mergedAt,headRefName",
+                "number,state,mergedAt,headRefName,headRefOid",
                 "--limit",
                 "100",
             ]),
@@ -367,6 +369,7 @@ impl GitHubAdapter {
                 .map(|pull_request| PullRequest {
                     number: pull_request.number,
                     merged: pull_request.state == "MERGED" && pull_request.merged_at.is_some(),
+                    head_commit: pull_request.head_ref_oid,
                 })
                 .collect(),
         ))
@@ -380,4 +383,5 @@ struct GitHubPullRequest {
     state: String,
     merged_at: Option<String>,
     head_ref_name: String,
+    head_ref_oid: String,
 }

@@ -104,6 +104,12 @@ fn fake_gh(temporary: &TempDir, body: &str) -> std::path::PathBuf {
     bin
 }
 
+fn merged_pull_request_body(branch: &str, head_commit: &str) -> String {
+    format!(
+        "printf '%s\\n' '[{{\"number\":42,\"state\":\"MERGED\",\"mergedAt\":\"2026-07-28T00:00:00Z\",\"headRefName\":\"{branch}\",\"headRefOid\":\"{head_commit}\"}}]'"
+    )
+}
+
 fn status(config: &Path, fake_bin: &Path) -> Output {
     let original_path = env::var_os("PATH").expect("PATH is set");
     let path = env::join_paths(
@@ -138,10 +144,11 @@ fn recycle(config: &Path, fake_bin: &Path) -> Output {
 fn status_reports_an_eligible_bench_without_changing_git_state() {
     let (temporary, repository) = fixture_repository();
     let config = write_config(&temporary, &repository);
-    let fake_bin = fake_gh(
-        &temporary,
-        "printf '%s\\n' '[{\"number\":42,\"state\":\"MERGED\",\"mergedAt\":\"2026-07-28T00:00:00Z\",\"headRefName\":\"feature/merged\"}]'",
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
     );
+    let fake_bin = fake_gh(&temporary, &pull_request);
     let before = git(&repository, &["status", "--porcelain=v1", "--branch"]);
     let before_refs = git(&repository, &["show-ref", "--head"]);
 
@@ -191,10 +198,11 @@ fn status_skips_a_dirty_bench_without_querying_github() {
 fn recycle_fast_forwards_the_standin_and_preserves_the_feature_ref() {
     let (temporary, repository) = recycle_fixture_repository();
     let config = write_config(&temporary, &repository);
-    let fake_bin = fake_gh(
-        &temporary,
-        "printf '%s\\n' '[{\"number\":42,\"state\":\"MERGED\",\"mergedAt\":\"2026-07-28T00:00:00Z\",\"headRefName\":\"feature/merged\"}]'",
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
     );
+    let fake_bin = fake_gh(&temporary, &pull_request);
     let feature_before = git(&repository, &["rev-parse", "feature/merged"]);
 
     let output = recycle(&config, &fake_bin);
@@ -267,10 +275,11 @@ fn recycle_continues_after_one_bench_fails() {
         ),
     )
     .expect("config file");
-    let fake_bin = fake_gh(
-        &temporary,
-        "printf '%s\\n' '[{\"number\":42,\"state\":\"MERGED\",\"mergedAt\":\"2026-07-28T00:00:00Z\",\"headRefName\":\"feature/merged\"}]'",
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
     );
+    let fake_bin = fake_gh(&temporary, &pull_request);
 
     let output = recycle(&config, &fake_bin);
 
@@ -305,6 +314,58 @@ fn status_skips_a_standin_checked_out_in_another_worktree() {
 
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("stand-in branch is checked out"));
+    assert_eq!(
+        git(&repository, &["status", "--porcelain=v1", "--branch"]),
+        before
+    );
+    assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
+}
+
+#[test]
+fn recycle_skips_a_bench_already_on_its_standin_branch() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    git(&repository, &["switch", "main-01"]);
+    let pull_request =
+        merged_pull_request_body("main-01", git(&repository, &["rev-parse", "HEAD"]).trim());
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    let before_refs = git(&repository, &["show-ref", "--head"]);
+
+    let output = recycle(&config, &fake_bin);
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("skipped (already on the stand-in branch)")
+    );
+    assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "main-01"
+    );
+    assert!(git(&repository, &["status", "--porcelain=v1"]).is_empty());
+}
+
+#[test]
+fn status_skips_a_local_tip_that_does_not_match_the_merged_pull_request() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let merged_head = git(&repository, &["rev-parse", "HEAD"]);
+    fs::write(repository.join("LOCAL.md"), "local follow-up\n").expect("local follow-up");
+    git(&repository, &["add", "LOCAL.md"]);
+    git(&repository, &["commit", "-m", "local follow-up"]);
+    let pull_request = merged_pull_request_body("feature/merged", merged_head.trim());
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    let before = git(&repository, &["status", "--porcelain=v1", "--branch"]);
+    let before_refs = git(&repository, &["show-ref", "--head"]);
+
+    let output = status(&config, &fake_bin);
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("skipped (current branch does not have exactly one merged pull request)")
+    );
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
