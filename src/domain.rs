@@ -34,7 +34,15 @@ pub struct BenchObservation {
 #[derive(Debug)]
 pub enum WorktreeState {
     Clean,
-    Dirty,
+    Dirty { files: Vec<DirtyFile> },
+}
+
+#[derive(Debug)]
+pub struct DirtyFile {
+    pub index_status: char,
+    pub worktree_status: char,
+    pub path: PathBuf,
+    pub original_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -103,7 +111,7 @@ pub enum SkipReason {
 
 pub fn decide(observation: &BenchObservation) -> BenchDecision {
     match observation.worktree {
-        WorktreeState::Dirty => BenchDecision::Skip(SkipReason::DirtyWorktree),
+        WorktreeState::Dirty { .. } => BenchDecision::Skip(SkipReason::DirtyWorktree),
         WorktreeState::Clean => match &observation.operation {
             OperationState::InProgress(operations) => {
                 BenchDecision::Skip(SkipReason::OperationInProgress(operations.clone()))
@@ -185,7 +193,14 @@ mod tests {
     #[test]
     fn dirty_worktree_wins_over_other_eligibility_signals() {
         let mut observation = observation();
-        observation.worktree = WorktreeState::Dirty;
+        observation.worktree = WorktreeState::Dirty {
+            files: vec![super::DirtyFile {
+                index_status: 'M',
+                worktree_status: ' ',
+                path: PathBuf::from("README.md"),
+                original_path: None,
+            }],
+        };
 
         assert!(matches!(
             decide(&observation),
