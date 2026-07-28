@@ -26,8 +26,15 @@ pub enum RunItem {
     Failed {
         bench: String,
         branch: Option<CurrentBranch>,
+        summary: &'static str,
         error: String,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct StatusFormat {
+    pub verbose: bool,
+    pub use_color: bool,
 }
 
 impl RunReport {
@@ -61,6 +68,7 @@ pub fn recycle(config: &Config, git: &GitAdapter, github: &GitHubAdapter) -> Run
                 .map(|bench| RunItem::Failed {
                     bench: bench.path.display().to_string(),
                     branch: None,
+                    summary: "upstream fetch failed",
                     error: format!("could not fetch upstream main before recycling: {error}"),
                 })
                 .collect(),
@@ -93,6 +101,7 @@ fn observed_item(
         Err(failure) => RunItem::Failed {
             bench: bench.path.display().to_string(),
             branch: failure.branch,
+            summary: failure.summary,
             error: failure.message,
         },
     }
@@ -110,6 +119,7 @@ fn recycle_item(
             return RunItem::Failed {
                 bench: bench.path.display().to_string(),
                 branch: failure.branch,
+                summary: failure.summary,
                 error: failure.message,
             };
         }
@@ -128,6 +138,7 @@ fn recycle_item(
             return RunItem::Failed {
                 bench: bench.path.display().to_string(),
                 branch: failure.branch,
+                summary: "pre-mutation recheck failed",
                 error: format!(
                     "could not recheck bench before mutation: {}",
                     failure.message
@@ -155,6 +166,7 @@ fn recycle_item(
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
             branch: None,
+            summary: "stand-in state was invalid",
             error: "eligible bench was missing a ready stand-in state".to_owned(),
         };
     };
@@ -166,6 +178,7 @@ fn recycle_item(
             return RunItem::Failed {
                 bench: bench.path.display().to_string(),
                 branch: None,
+                summary: "feature branch lookup failed",
                 error: format!("could not record feature branch before mutation: {error}"),
             };
         }
@@ -180,6 +193,7 @@ fn recycle_item(
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
             branch: None,
+            summary: "stand-in update failed",
             error: format!("could not advance stand-in branch: {error}"),
         };
     }
@@ -187,6 +201,7 @@ fn recycle_item(
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
             branch: None,
+            summary: "worktree switch failed",
             error: format!(
                 "stand-in branch advanced, but switching the worktree failed; feature branch remains {feature_ref} at {feature_commit}: {error}"
             ),
@@ -210,6 +225,7 @@ fn recycle_item(
         Err(error) => RunItem::Failed {
             bench: bench.path.display().to_string(),
             branch: None,
+            summary: "post-recycle verification failed",
             error: format!("recycle completed with a failed postcondition: {error}"),
         },
     }
@@ -266,6 +282,7 @@ fn verify_recycle(
 #[derive(Debug)]
 struct ObservationFailure {
     branch: Option<CurrentBranch>,
+    summary: &'static str,
     message: String,
 }
 
@@ -279,11 +296,13 @@ fn observe(
         .same_repository(&config.repository.path, &bench.path)
         .map_err(|error| ObservationFailure {
             branch: None,
+            summary: "repository check failed",
             message: error.to_string(),
         })?
     {
         return Err(ObservationFailure {
             branch: None,
+            summary: "repository check failed",
             message: "bench is not a worktree of the configured repository".to_owned(),
         });
     }
@@ -291,15 +310,28 @@ fn observe(
         .current_branch(&bench.path)
         .map_err(|error| ObservationFailure {
             branch: None,
+            summary: "branch lookup failed",
             message: error.to_string(),
         })?;
     let worktree = match git.worktree_state(&bench.path) {
         Ok(state) => state,
-        Err(error) => return Err(observation_failure(branch, error)),
+        Err(error) => {
+            return Err(observation_failure(
+                branch,
+                "worktree status lookup failed",
+                error,
+            ));
+        }
     };
     let operation = match git.operation_state(&bench.path) {
         Ok(state) => state,
-        Err(error) => return Err(observation_failure(branch, error)),
+        Err(error) => {
+            return Err(observation_failure(
+                branch,
+                "Git operation lookup failed",
+                error,
+            ));
+        }
     };
     let standin = match git.standin_state(
         &config.repository.path,
@@ -309,7 +341,7 @@ fn observe(
         &bench.standin_branch,
     ) {
         Ok(state) => state,
-        Err(error) => return Err(observation_failure(branch, error)),
+        Err(error) => return Err(observation_failure(branch, "stand-in lookup failed", error)),
     };
 
     let pull_requests = match (&worktree, &operation, &branch, &standin) {
@@ -320,7 +352,13 @@ fn observe(
             StandinState::Ready { .. },
         ) => match github.pull_requests(&config.repository.path, name) {
             Ok(state) => state,
-            Err(error) => return Err(observation_failure(branch, error)),
+            Err(error) => {
+                return Err(observation_failure(
+                    branch,
+                    "pull-request lookup failed",
+                    error,
+                ));
+            }
         },
         _ => PullRequestState::NotChecked,
     };
@@ -335,9 +373,14 @@ fn observe(
     })
 }
 
-fn observation_failure(branch: CurrentBranch, error: impl std::fmt::Display) -> ObservationFailure {
+fn observation_failure(
+    branch: CurrentBranch,
+    summary: &'static str,
+    error: impl std::fmt::Display,
+) -> ObservationFailure {
     ObservationFailure {
         branch: Some(branch),
+        summary,
         message: error.to_string(),
     }
 }
@@ -385,6 +428,7 @@ pub fn format_report(report: &RunReport) -> String {
             RunItem::Failed {
                 bench,
                 branch,
+                summary: _,
                 error,
             } => {
                 failed += 1;
@@ -404,6 +448,237 @@ pub fn format_report(report: &RunReport) -> String {
         "summary: {eligible} eligible, {recycled} recycled, {skipped} skipped, {failed} failed"
     );
     formatted
+}
+
+pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String {
+    let mut formatted = String::new();
+    let labels = status_labels(report);
+    let eligible = report
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RunItem::Observed {
+                    decision: BenchDecision::Eligible { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+
+    for (index, item) in report.items.iter().enumerate() {
+        match item {
+            RunItem::Observed {
+                observation,
+                decision,
+            } => {
+                let (role, reason) = status_observed_role_and_reason(observation, decision);
+                write_status_row(
+                    &mut formatted,
+                    role,
+                    &labels[index],
+                    branch_name(&observation.branch),
+                    &reason,
+                    format.use_color,
+                );
+                if format.verbose {
+                    write_status_details(&mut formatted, observation);
+                }
+            }
+            RunItem::Failed {
+                bench,
+                branch,
+                summary,
+                error,
+            } => {
+                write_status_row(
+                    &mut formatted,
+                    StatusRole::Failed,
+                    &labels[index],
+                    branch.as_ref().map(branch_name).unwrap_or("unknown"),
+                    summary,
+                    format.use_color,
+                );
+                if format.verbose {
+                    let _ = writeln!(formatted, "    path: {bench}");
+                    let _ = writeln!(formatted, "    error: {error}");
+                }
+            }
+            RunItem::Recycled {
+                bench,
+                previous_branch,
+                standin_branch,
+                upstream_commit,
+            } => {
+                write_status_row(
+                    &mut formatted,
+                    StatusRole::Idle,
+                    &labels[index],
+                    standin_branch,
+                    &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
+                    format.use_color,
+                );
+                if format.verbose {
+                    let _ = writeln!(formatted, "    path: {bench}");
+                }
+            }
+        }
+    }
+
+    let bench_word = if report.items.len() == 1 {
+        "bench"
+    } else {
+        "benches"
+    };
+    let eligible_word = if eligible == 1 { "bench" } else { "benches" };
+    let _ = writeln!(formatted);
+    let _ = writeln!(formatted, "Checked {} {bench_word}", report.items.len());
+    let _ = writeln!(
+        formatted,
+        "{eligible} {eligible_word} eligible for `bu recycle`"
+    );
+    formatted
+}
+
+#[derive(Clone, Copy)]
+enum StatusRole {
+    Eligible,
+    Blocked,
+    Idle,
+    Failed,
+}
+
+impl StatusRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Blocked => "blocked",
+            Self::Idle => "idle",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn ansi(self) -> &'static str {
+        match self {
+            Self::Eligible => "\x1b[36m",
+            Self::Blocked => "\x1b[33m",
+            Self::Idle => "\x1b[2;90m",
+            Self::Failed => "\x1b[31m",
+        }
+    }
+}
+
+fn status_labels(report: &RunReport) -> Vec<String> {
+    let paths = report.items.iter().map(item_bench_path).collect::<Vec<_>>();
+    let basenames = paths
+        .iter()
+        .map(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .filter(|name| !name.is_empty())
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>();
+
+    basenames
+        .iter()
+        .enumerate()
+        .map(|(index, basename)| match basename {
+            Some(basename)
+                if basenames
+                    .iter()
+                    .filter(|other| other.as_ref() == Some(basename))
+                    .count()
+                    == 1 =>
+            {
+                basename.clone()
+            }
+            _ => paths[index].clone(),
+        })
+        .collect()
+}
+
+fn item_bench_path(item: &RunItem) -> String {
+    match item {
+        RunItem::Observed { observation, .. } => observation.bench.path.display().to_string(),
+        RunItem::Recycled { bench, .. } | RunItem::Failed { bench, .. } => bench.clone(),
+    }
+}
+
+fn status_observed_role_and_reason(
+    observation: &BenchObservation,
+    decision: &BenchDecision,
+) -> (StatusRole, String) {
+    match decision {
+        BenchDecision::Eligible { pull_request, .. } => (
+            StatusRole::Eligible,
+            format!("merged pull request #{pull_request}"),
+        ),
+        BenchDecision::Skip(reason) => {
+            let role = match reason {
+                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => {
+                    StatusRole::Idle
+                }
+                _ => StatusRole::Blocked,
+            };
+            let description = match (&observation.worktree, reason) {
+                (WorktreeState::Dirty { files }, SkipReason::DirtyWorktree) => {
+                    let file_word = if files.len() == 1 { "file" } else { "files" };
+                    format!("dirty worktree ({} {file_word})", files.len())
+                }
+                _ => format_skip_reason(reason),
+            };
+            (role, description)
+        }
+    }
+}
+
+fn write_status_row(
+    formatted: &mut String,
+    role: StatusRole,
+    bench: &str,
+    branch: &str,
+    reason: &str,
+    use_color: bool,
+) {
+    let marker = if use_color {
+        format!("{}▎\x1b[0m", role.ansi())
+    } else {
+        "▎".to_owned()
+    };
+    let _ = writeln!(
+        formatted,
+        "{marker} {:<8} {bench} {branch} {reason}",
+        role.label()
+    );
+}
+
+fn write_status_details(formatted: &mut String, observation: &BenchObservation) {
+    let _ = writeln!(formatted, "    path: {}", observation.bench.path.display());
+    if let WorktreeState::Dirty { files } = &observation.worktree {
+        for file in files {
+            let path = format_path(&file.path);
+            match &file.original_path {
+                Some(original_path) => {
+                    let _ = writeln!(
+                        formatted,
+                        "    {}{} {} -> {path}",
+                        file.index_status,
+                        file.worktree_status,
+                        format_path(original_path),
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        formatted,
+                        "    {}{} {path}",
+                        file.index_status, file.worktree_status,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn write_observed_block(
@@ -498,5 +773,38 @@ fn format_skip_reason(reason: &SkipReason) -> String {
         SkipReason::PullRequestDoesNotMatch => {
             "current branch does not have exactly one merged pull request".to_owned()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunItem, RunReport, status_labels};
+
+    #[test]
+    fn duplicate_basenames_use_full_configured_paths() {
+        let report = RunReport {
+            items: vec![
+                RunItem::Failed {
+                    bench: "/benches/one/multiplier-01".to_owned(),
+                    branch: None,
+                    summary: "repository check failed",
+                    error: "first failure".to_owned(),
+                },
+                RunItem::Failed {
+                    bench: "/benches/two/multiplier-01".to_owned(),
+                    branch: None,
+                    summary: "repository check failed",
+                    error: "second failure".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            status_labels(&report),
+            [
+                "/benches/one/multiplier-01".to_owned(),
+                "/benches/two/multiplier-01".to_owned(),
+            ]
+        );
     }
 }

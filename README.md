@@ -6,10 +6,14 @@
 
 ```text
 bu status
+bu status --verbose
+bu status --color auto|always|never
 bu recycle
 ```
 
-`status` is read-only. `recycle` fetches the configured upstream once, then mutates only benches that pass every safety check.
+`status` is read-only. By default it prints one concise row per bench and a summary. Use `-v` or `--verbose` for configured paths, structured dirty files, and complete failure diagnostics. Status styling colors only the leading marker; `auto` (the default) uses color only on a terminal without `NO_COLOR`, while `always` and `never` override that policy.
+
+`recycle` fetches the configured upstream once, then mutates only benches that pass every safety check.
 
 ## Configuration
 
@@ -30,7 +34,7 @@ Use `bu --config /path/to/config.toml status` to test a configuration without in
 
 ## Safety model
 
-`status` only runs read-only Git and GitHub queries. It reports each configured bench as eligible, skipped, or failed; ordinary skips do not make the command fail.
+`status` only runs read-only Git and GitHub queries. It reports each configured bench as eligible, blocked, idle, or failed; ordinary blocked and idle benches do not make the command fail.
 
 `recycle` first fetches `origin/main`. For each eligible bench, it rechecks cleanliness, normal Git operation state, branch attachment, one merged pull request, stand-in ownership, and fast-forwardability. It then atomically advances only the stand-in ref, switches to it without discarding changes, and verifies that the feature ref is unchanged and the worktree is clean. Any operational failure is reported per bench and produces a nonzero exit status.
 

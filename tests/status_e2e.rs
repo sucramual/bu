@@ -111,6 +111,15 @@ fn merged_pull_request_body(branch: &str, head_commit: &str) -> String {
 }
 
 fn status(config: &Path, fake_bin: &Path) -> Output {
+    status_with(config, fake_bin, &[], &[])
+}
+
+fn status_with(
+    config: &Path,
+    fake_bin: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
     let original_path = env::var_os("PATH").expect("PATH is set");
     let path = env::join_paths(
         std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&original_path)),
@@ -120,7 +129,9 @@ fn status(config: &Path, fake_bin: &Path) -> Output {
         .args(["--config"])
         .arg(config)
         .arg("status")
+        .args(arguments)
         .env("PATH", path)
+        .envs(environment.iter().copied())
         .output()
         .expect("bu should start")
 }
@@ -160,14 +171,54 @@ fn status_reports_an_eligible_bench_without_changing_git_state() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(
-        "\n  branch: feature/merged\n  status: eligible\n  reason: merged pull request #42\n"
-    ));
+    assert!(stdout.contains("▎ eligible repository feature/merged merged pull request #42\n"));
+    assert!(stdout.contains("\nChecked 1 bench\n1 bench eligible for `bu recycle`\n"));
+    assert!(!stdout.contains('\x1b'));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
     );
     assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
+}
+
+#[test]
+fn status_color_policy_styles_only_the_marker_and_honors_overrides() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+
+    let always = status_with(
+        &config,
+        &fake_bin,
+        &["--color", "always"],
+        &[("NO_COLOR", "1")],
+    );
+    assert!(always.status.success());
+    let always_stdout = String::from_utf8_lossy(&always.stdout);
+    assert!(always_stdout.contains("\x1b[36m▎\x1b[0m eligible repository"));
+    assert_eq!(always_stdout.matches('\x1b').count(), 2);
+
+    let never = status_with(
+        &config,
+        &fake_bin,
+        &["--color", "never"],
+        &[("NO_COLOR", "1")],
+    );
+    assert!(never.status.success());
+    assert!(!String::from_utf8_lossy(&never.stdout).contains('\x1b'));
+
+    let no_color = status_with(
+        &config,
+        &fake_bin,
+        &["--color", "auto"],
+        &[("NO_COLOR", "1")],
+    );
+    assert!(no_color.status.success());
+    assert!(!String::from_utf8_lossy(&no_color.stdout).contains('\x1b'));
 }
 
 #[test]
@@ -187,11 +238,8 @@ fn status_skips_a_dirty_bench_without_querying_github() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout
-            .contains("  branch: feature/merged\n  status: skipped\n  reason: worktree is dirty\n")
-    );
-    assert!(stdout.contains("  dirty:\n     M README.md\n"));
+    assert!(stdout.contains("▎ blocked  repository feature/merged dirty worktree (1 file)\n"));
+    assert!(!stdout.contains(" M README.md\n"));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
@@ -327,7 +375,10 @@ fn status_skips_a_standin_checked_out_in_another_worktree() {
     let output = status(&config, &fake_bin);
 
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("stand-in branch is checked out"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("▎ blocked  repository feature/merged stand-in branch is checked out")
+    );
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
@@ -377,7 +428,7 @@ fn status_skips_a_local_tip_that_does_not_match_the_merged_pull_request() {
 
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains(
-        "  status: skipped\n  reason: current branch does not have exactly one merged pull request"
+        "▎ idle     repository feature/merged current branch does not have exactly one merged pull request"
     ));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
@@ -400,11 +451,11 @@ fn status_reports_every_structured_dirty_file() {
     fs::write(repository.join("UNTRACKED.md"), "untracked\n").expect("untracked file");
     git(&repository, &["mv", "SOURCE.md", "RENAMED.md"]);
 
-    let output = status(&config, &fake_bin);
+    let output = status_with(&config, &fake_bin, &["--verbose"], &[]);
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("  dirty:\n"));
+    assert!(stdout.contains(&format!("    path: {}\n", repository.display())));
     assert!(stdout.contains("    A  STAGED.md\n"));
     assert!(stdout.contains("     M README.md\n"));
     assert!(stdout.contains("    ?? UNTRACKED.md\n"));
@@ -426,7 +477,7 @@ fn status_escapes_control_characters_in_dirty_file_paths() {
     git(&repository, &["mv", source, "RENAMED.md"]);
     fs::write(repository.join("line\nname\u{1b}[31m"), "dirty\n").expect("dirty file");
 
-    let output = status(&config, &fake_bin);
+    let output = status_with(&config, &fake_bin, &["-v"], &[]);
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -447,7 +498,7 @@ fn status_reports_a_detached_head() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("  branch: detached\n  status: skipped\n  reason: HEAD is detached\n"));
+    assert!(stdout.contains("▎ blocked  repository detached HEAD is detached\n"));
 }
 
 #[test]
@@ -456,11 +507,13 @@ fn status_retains_a_discovered_branch_when_later_inspection_fails() {
     let config = write_config(&temporary, &repository);
     let fake_bin = fake_gh(&temporary, "exit 99");
 
-    let output = status(&config, &fake_bin);
+    let output = status_with(&config, &fake_bin, &["--verbose"], &[]);
 
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("  branch: feature/merged\n  status: failed\n"));
+    assert!(stdout.contains("▎ failed   repository feature/merged pull-request lookup failed\n"));
+    assert!(stdout.contains(&format!("    path: {}\n", repository.display())));
+    assert!(stdout.contains("    error: gh pr list"));
     assert!(stdout.contains("gh pr list"));
 }
 
@@ -484,6 +537,8 @@ fn status_reports_unknown_when_branch_discovery_does_not_complete() {
 
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("  branch: unknown\n  status: failed\n")
+        String::from_utf8_lossy(&output.stdout)
+            .contains("▎ failed   missing-bench unknown repository check failed\n")
     );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("git rev-parse"));
 }
