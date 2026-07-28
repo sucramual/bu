@@ -219,7 +219,7 @@ fn recycle_fast_forwards_the_standin_and_preserves_the_feature_ref() {
     );
     assert!(
         String::from_utf8_lossy(&output.stdout)
-            .contains("  status: recycled\n  reason: feature/merged preserved")
+            .contains("  branch: main-01\n  status: recycled\n  reason: feature/merged preserved")
     );
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
@@ -409,6 +409,31 @@ fn status_reports_every_structured_dirty_file() {
     assert!(stdout.contains("     M README.md\n"));
     assert!(stdout.contains("    ?? UNTRACKED.md\n"));
     assert!(stdout.contains("    R  SOURCE.md -> RENAMED.md\n"));
+}
+
+#[test]
+fn status_escapes_control_characters_in_dirty_file_paths() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary, "exit 99");
+    let source = "source\nname\u{1b}[31m";
+    fs::write(repository.join(source), "source\n").expect("rename source");
+    git(&repository, &["add", source]);
+    git(
+        &repository,
+        &["commit", "-m", "add control-character rename source"],
+    );
+    git(&repository, &["mv", source, "RENAMED.md"]);
+    fs::write(repository.join("line\nname\u{1b}[31m"), "dirty\n").expect("dirty file");
+
+    let output = status(&config, &fake_bin);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("    ?? line\\nname\\u{1b}[31m\n"));
+    assert!(stdout.contains("    R  source\\nname\\u{1b}[31m -> RENAMED.md\n"));
+    assert!(!stdout.contains("line\nname\u{1b}[31m"));
+    assert!(!stdout.contains(source));
 }
 
 #[test]

@@ -377,7 +377,7 @@ pub fn format_report(report: &RunReport) -> String {
                 write_block(
                     &mut formatted,
                     bench,
-                    Some(previous_branch),
+                    Some(standin_branch),
                     "recycled",
                     &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
                 );
@@ -422,7 +422,7 @@ fn write_observed_block(
     if let WorktreeState::Dirty { files } = &observation.worktree {
         let _ = writeln!(formatted, "  dirty:");
         for file in files {
-            let path = file.path.display();
+            let path = format_path(&file.path);
             match &file.original_path {
                 Some(original_path) => {
                     let _ = writeln!(
@@ -430,7 +430,7 @@ fn write_observed_block(
                         "    {}{} {} -> {path}",
                         file.index_status,
                         file.worktree_status,
-                        original_path.display(),
+                        format_path(original_path),
                     );
                 }
                 None => {
@@ -443,6 +443,10 @@ fn write_observed_block(
             }
         }
     }
+}
+
+fn format_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().escape_default().to_string()
 }
 
 fn write_block(
