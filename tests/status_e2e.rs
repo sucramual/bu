@@ -159,10 +159,10 @@ fn status_reports_an_eligible_bench_without_changing_git_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("eligible (branch feature/merged, PR #42)")
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(
+        "\n  branch: feature/merged\n  status: eligible\n  reason: merged pull request #42\n"
+    ));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
@@ -186,7 +186,12 @@ fn status_skips_a_dirty_bench_without_querying_github() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("skipped (worktree is dirty)"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout
+            .contains("  branch: feature/merged\n  status: skipped\n  reason: worktree is dirty\n")
+    );
+    assert!(stdout.contains("  dirty:\n     M README.md\n"));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
@@ -212,7 +217,10 @@ fn recycle_fast_forwards_the_standin_and_preserves_the_feature_ref() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("recycled (feature/merged preserved"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("  branch: main-01\n  status: recycled\n  reason: feature/merged preserved")
+    );
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
         "main-01"
@@ -284,8 +292,14 @@ fn recycle_continues_after_one_bench_fails() {
     let output = recycle(&config, &fake_bin);
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("missing-bench: failed"));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("recycled (feature/merged preserved"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("missing-bench\n  branch: unknown\n  status: failed")
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("  status: recycled\n  reason: feature/merged preserved")
+    );
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
         "main-01"
@@ -336,7 +350,7 @@ fn recycle_skips_a_bench_already_on_its_standin_branch() {
     assert!(output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stdout)
-            .contains("skipped (already on the stand-in branch)")
+            .contains("  status: skipped\n  reason: already on the stand-in branch")
     );
     assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
     assert_eq!(
@@ -362,13 +376,114 @@ fn status_skips_a_local_tip_that_does_not_match_the_merged_pull_request() {
     let output = status(&config, &fake_bin);
 
     assert!(output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("skipped (current branch does not have exactly one merged pull request)")
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(
+        "  status: skipped\n  reason: current branch does not have exactly one merged pull request"
+    ));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
     );
     assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
+}
+
+#[test]
+fn status_reports_every_structured_dirty_file() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary, "exit 99");
+    fs::write(repository.join("SOURCE.md"), "source\n").expect("rename source");
+    git(&repository, &["add", "SOURCE.md"]);
+    git(&repository, &["commit", "-m", "add rename source"]);
+    fs::write(repository.join("STAGED.md"), "staged\n").expect("staged file");
+    git(&repository, &["add", "STAGED.md"]);
+    fs::write(repository.join("README.md"), "unstaged\n").expect("unstaged file");
+    fs::write(repository.join("UNTRACKED.md"), "untracked\n").expect("untracked file");
+    git(&repository, &["mv", "SOURCE.md", "RENAMED.md"]);
+
+    let output = status(&config, &fake_bin);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  dirty:\n"));
+    assert!(stdout.contains("    A  STAGED.md\n"));
+    assert!(stdout.contains("     M README.md\n"));
+    assert!(stdout.contains("    ?? UNTRACKED.md\n"));
+    assert!(stdout.contains("    R  SOURCE.md -> RENAMED.md\n"));
+}
+
+#[test]
+fn status_escapes_control_characters_in_dirty_file_paths() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary, "exit 99");
+    let source = "source\nname\u{1b}[31m";
+    fs::write(repository.join(source), "source\n").expect("rename source");
+    git(&repository, &["add", source]);
+    git(
+        &repository,
+        &["commit", "-m", "add control-character rename source"],
+    );
+    git(&repository, &["mv", source, "RENAMED.md"]);
+    fs::write(repository.join("line\nname\u{1b}[31m"), "dirty\n").expect("dirty file");
+
+    let output = status(&config, &fake_bin);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("    ?? line\\nname\\u{1b}[31m\n"));
+    assert!(stdout.contains("    R  source\\nname\\u{1b}[31m -> RENAMED.md\n"));
+    assert!(!stdout.contains("line\nname\u{1b}[31m"));
+    assert!(!stdout.contains(source));
+}
+
+#[test]
+fn status_reports_a_detached_head() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary, "exit 99");
+    git(&repository, &["checkout", "--detach"]);
+
+    let output = status(&config, &fake_bin);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  branch: detached\n  status: skipped\n  reason: HEAD is detached\n"));
+}
+
+#[test]
+fn status_retains_a_discovered_branch_when_later_inspection_fails() {
+    let (temporary, repository) = fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary, "exit 99");
+
+    let output = status(&config, &fake_bin);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("  branch: feature/merged\n  status: failed\n"));
+    assert!(stdout.contains("gh pr list"));
+}
+
+#[test]
+fn status_reports_unknown_when_branch_discovery_does_not_complete() {
+    let (temporary, repository) = fixture_repository();
+    let missing = temporary.path().join("missing-bench");
+    let config = temporary.path().join("missing-bench.toml");
+    fs::write(
+        &config,
+        format!(
+            "[repository]\npath = \"{}\"\nremote = \"origin\"\nmain_branch = \"main\"\n\n[[benches]]\npath = \"{}\"\nstandin_branch = \"main-01\"\n",
+            repository.display(),
+            missing.display(),
+        ),
+    )
+    .expect("config file");
+    let fake_bin = fake_gh(&temporary, "exit 99");
+
+    let output = status(&config, &fake_bin);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("  branch: unknown\n  status: failed\n")
+    );
 }

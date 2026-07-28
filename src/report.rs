@@ -25,6 +25,7 @@ pub enum RunItem {
     },
     Failed {
         bench: String,
+        branch: Option<CurrentBranch>,
         error: String,
     },
 }
@@ -59,6 +60,7 @@ pub fn recycle(config: &Config, git: &GitAdapter, github: &GitHubAdapter) -> Run
                 .iter()
                 .map(|bench| RunItem::Failed {
                     bench: bench.path.display().to_string(),
+                    branch: None,
                     error: format!("could not fetch upstream main before recycling: {error}"),
                 })
                 .collect(),
@@ -88,9 +90,10 @@ fn observed_item(
                 decision,
             }
         }
-        Err(error) => RunItem::Failed {
+        Err(failure) => RunItem::Failed {
             bench: bench.path.display().to_string(),
-            error,
+            branch: failure.branch,
+            error: failure.message,
         },
     }
 }
@@ -103,10 +106,11 @@ fn recycle_item(
 ) -> RunItem {
     let observation = match observe(config, bench, git, github) {
         Ok(observation) => observation,
-        Err(error) => {
+        Err(failure) => {
             return RunItem::Failed {
                 bench: bench.path.display().to_string(),
-                error,
+                branch: failure.branch,
+                error: failure.message,
             };
         }
     };
@@ -120,10 +124,14 @@ fn recycle_item(
 
     let recheck = match observe(config, bench, git, github) {
         Ok(observation) => observation,
-        Err(error) => {
+        Err(failure) => {
             return RunItem::Failed {
                 bench: bench.path.display().to_string(),
-                error: format!("could not recheck bench before mutation: {error}"),
+                branch: failure.branch,
+                error: format!(
+                    "could not recheck bench before mutation: {}",
+                    failure.message
+                ),
             };
         }
     };
@@ -146,6 +154,7 @@ fn recycle_item(
     else {
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
+            branch: None,
             error: "eligible bench was missing a ready stand-in state".to_owned(),
         };
     };
@@ -156,6 +165,7 @@ fn recycle_item(
         Err(error) => {
             return RunItem::Failed {
                 bench: bench.path.display().to_string(),
+                branch: None,
                 error: format!("could not record feature branch before mutation: {error}"),
             };
         }
@@ -169,12 +179,14 @@ fn recycle_item(
     ) {
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
+            branch: None,
             error: format!("could not advance stand-in branch: {error}"),
         };
     }
     if let Err(error) = git.switch_branch(&bench.path, &bench.standin_branch) {
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
+            branch: None,
             error: format!(
                 "stand-in branch advanced, but switching the worktree failed; feature branch remains {feature_ref} at {feature_commit}: {error}"
             ),
@@ -197,6 +209,7 @@ fn recycle_item(
         },
         Err(error) => RunItem::Failed {
             bench: bench.path.display().to_string(),
+            branch: None,
             error: format!("recycle completed with a failed postcondition: {error}"),
         },
     }
@@ -250,36 +263,54 @@ fn verify_recycle(
     Ok(())
 }
 
+#[derive(Debug)]
+struct ObservationFailure {
+    branch: Option<CurrentBranch>,
+    message: String,
+}
+
 fn observe(
     config: &Config,
     bench: &BenchConfig,
     git: &GitAdapter,
     github: &GitHubAdapter,
-) -> Result<BenchObservation, String> {
+) -> Result<BenchObservation, ObservationFailure> {
     if !git
         .same_repository(&config.repository.path, &bench.path)
-        .map_err(|error| error.to_string())?
+        .map_err(|error| ObservationFailure {
+            branch: None,
+            message: error.to_string(),
+        })?
     {
-        return Err("bench is not a worktree of the configured repository".to_owned());
+        return Err(ObservationFailure {
+            branch: None,
+            message: "bench is not a worktree of the configured repository".to_owned(),
+        });
     }
-    let worktree = git
-        .worktree_state(&bench.path)
-        .map_err(|error| error.to_string())?;
     let branch = git
         .current_branch(&bench.path)
-        .map_err(|error| error.to_string())?;
-    let operation = git
-        .operation_state(&bench.path)
-        .map_err(|error| error.to_string())?;
-    let standin = git
-        .standin_state(
-            &config.repository.path,
-            &bench.path,
-            &config.repository.remote,
-            &config.repository.main_branch,
-            &bench.standin_branch,
-        )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ObservationFailure {
+            branch: None,
+            message: error.to_string(),
+        })?;
+    let worktree = match git.worktree_state(&bench.path) {
+        Ok(state) => state,
+        Err(error) => return Err(observation_failure(branch, error)),
+    };
+    let operation = match git.operation_state(&bench.path) {
+        Ok(state) => state,
+        Err(error) => return Err(observation_failure(branch, error)),
+    };
+    let standin = match git.standin_state(
+        &config.repository.path,
+        &bench.path,
+        &config.repository.remote,
+        &config.repository.main_branch,
+        &bench.standin_branch,
+    ) {
+        Ok(state) => state,
+        Err(error) => return Err(observation_failure(branch, error)),
+    };
 
     let pull_requests = match (&worktree, &operation, &branch, &standin) {
         (
@@ -287,9 +318,10 @@ fn observe(
             OperationState::Normal,
             CurrentBranch::Attached { name, .. },
             StandinState::Ready { .. },
-        ) => github
-            .pull_requests(&config.repository.path, name)
-            .map_err(|error| error.to_string())?,
+        ) => match github.pull_requests(&config.repository.path, name) {
+            Ok(state) => state,
+            Err(error) => return Err(observation_failure(branch, error)),
+        },
         _ => PullRequestState::NotChecked,
     };
 
@@ -301,6 +333,13 @@ fn observe(
         standin,
         pull_requests,
     })
+}
+
+fn observation_failure(branch: CurrentBranch, error: impl std::fmt::Display) -> ObservationFailure {
+    ObservationFailure {
+        branch: Some(branch),
+        message: error.to_string(),
+    }
 }
 
 pub fn format_report(report: &RunReport) -> String {
@@ -315,28 +354,19 @@ pub fn format_report(report: &RunReport) -> String {
             RunItem::Observed {
                 observation,
                 decision,
-            } => match decision {
-                BenchDecision::Eligible {
-                    branch,
-                    pull_request,
-                } => {
-                    eligible += 1;
-                    let _ = writeln!(
-                        formatted,
-                        "{}: eligible (branch {branch}, PR #{pull_request})",
-                        observation.bench.path.display()
-                    );
-                }
-                BenchDecision::Skip(reason) => {
-                    skipped += 1;
-                    let _ = writeln!(
-                        formatted,
-                        "{}: skipped ({})",
-                        observation.bench.path.display(),
-                        format_skip_reason(reason)
-                    );
-                }
-            },
+            } => {
+                let (status, reason) = match decision {
+                    BenchDecision::Eligible { pull_request, .. } => {
+                        eligible += 1;
+                        ("eligible", format!("merged pull request #{pull_request}"))
+                    }
+                    BenchDecision::Skip(reason) => {
+                        skipped += 1;
+                        ("skipped", format_skip_reason(reason))
+                    }
+                };
+                write_observed_block(&mut formatted, observation, status, &reason);
+            }
             RunItem::Recycled {
                 bench,
                 previous_branch,
@@ -344,14 +374,27 @@ pub fn format_report(report: &RunReport) -> String {
                 upstream_commit,
             } => {
                 recycled += 1;
-                let _ = writeln!(
-                    formatted,
-                    "{bench}: recycled ({previous_branch} preserved; {standin_branch} -> {upstream_commit})"
+                write_block(
+                    &mut formatted,
+                    bench,
+                    Some(standin_branch),
+                    "recycled",
+                    &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
                 );
             }
-            RunItem::Failed { bench, error } => {
+            RunItem::Failed {
+                bench,
+                branch,
+                error,
+            } => {
                 failed += 1;
-                let _ = writeln!(formatted, "{bench}: failed ({error})");
+                write_block(
+                    &mut formatted,
+                    bench,
+                    branch.as_ref().map(branch_name),
+                    "failed",
+                    error,
+                );
             }
         }
     }
@@ -361,6 +404,69 @@ pub fn format_report(report: &RunReport) -> String {
         "summary: {eligible} eligible, {recycled} recycled, {skipped} skipped, {failed} failed"
     );
     formatted
+}
+
+fn write_observed_block(
+    formatted: &mut String,
+    observation: &BenchObservation,
+    status: &str,
+    reason: &str,
+) {
+    write_block(
+        formatted,
+        &observation.bench.path.display().to_string(),
+        Some(branch_name(&observation.branch)),
+        status,
+        reason,
+    );
+    if let WorktreeState::Dirty { files } = &observation.worktree {
+        let _ = writeln!(formatted, "  dirty:");
+        for file in files {
+            let path = format_path(&file.path);
+            match &file.original_path {
+                Some(original_path) => {
+                    let _ = writeln!(
+                        formatted,
+                        "    {}{} {} -> {path}",
+                        file.index_status,
+                        file.worktree_status,
+                        format_path(original_path),
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        formatted,
+                        "    {}{} {path}",
+                        file.index_status, file.worktree_status,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn format_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().escape_default().to_string()
+}
+
+fn write_block(
+    formatted: &mut String,
+    bench: &str,
+    branch: Option<&str>,
+    status: &str,
+    reason: &str,
+) {
+    let _ = writeln!(formatted, "{bench}");
+    let _ = writeln!(formatted, "  branch: {}", branch.unwrap_or("unknown"));
+    let _ = writeln!(formatted, "  status: {status}");
+    let _ = writeln!(formatted, "  reason: {reason}");
+}
+
+fn branch_name(branch: &CurrentBranch) -> &str {
+    match branch {
+        CurrentBranch::Attached { name, .. } => name,
+        CurrentBranch::Detached => "detached",
+    }
 }
 
 fn format_skip_reason(reason: &SkipReason) -> String {

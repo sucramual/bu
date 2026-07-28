@@ -5,8 +5,8 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::domain::{
-    CurrentBranch, GitOperation, OperationState, PullRequest, PullRequestState, StandinState,
-    WorktreeState,
+    CurrentBranch, DirtyFile, GitOperation, OperationState, PullRequest, PullRequestState,
+    StandinState, WorktreeState,
 };
 use crate::error::AdapterError;
 
@@ -16,6 +16,7 @@ struct CommandOutput {
     success: bool,
     status: String,
     stdout: String,
+    raw_stdout: Vec<u8>,
     stderr: String,
 }
 
@@ -42,6 +43,7 @@ fn run_command(
             |code| code.to_string(),
         ),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        raw_stdout: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
 }
@@ -71,17 +73,13 @@ impl GitAdapter {
         let output = run_command(
             bench,
             "git",
-            &arguments(&["status", "--porcelain=v1", "--untracked-files=all"]),
+            &arguments(&["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
         )?;
         if !output.success {
             return Err(unexpected_exit("git status", bench, output));
         }
 
-        Ok(if output.stdout.is_empty() {
-            WorktreeState::Clean
-        } else {
-            WorktreeState::Dirty
-        })
+        parse_worktree_state(&output.raw_stdout, bench)
     }
 
     pub fn same_repository(&self, repository: &Path, bench: &Path) -> Result<bool, AdapterError> {
@@ -321,6 +319,137 @@ impl GitAdapter {
             }
         }
         Ok(None)
+    }
+}
+
+fn parse_worktree_state(output: &[u8], bench: &Path) -> Result<WorktreeState, AdapterError> {
+    if output.is_empty() {
+        return Ok(WorktreeState::Clean);
+    }
+
+    let mut files = Vec::new();
+    let mut offset = 0;
+    while offset < output.len() {
+        let record_end = output[offset..]
+            .iter()
+            .position(|byte| *byte == b'\0')
+            .map(|position| offset + position)
+            .ok_or_else(|| invalid_status(bench, "record is not NUL-terminated"))?;
+        let record = &output[offset..record_end];
+        offset = record_end + 1;
+
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(invalid_status(
+                bench,
+                "record is missing its two-character status",
+            ));
+        }
+        let index_status = char::from(record[0]);
+        let worktree_status = char::from(record[1]);
+        if !is_status_code(index_status) || !is_status_code(worktree_status) {
+            return Err(invalid_status(bench, "status code is not valid porcelain"));
+        }
+        let path = PathBuf::from(String::from_utf8_lossy(&record[3..]).into_owned());
+        if path.as_os_str().is_empty() {
+            return Err(invalid_status(bench, "record is missing a path"));
+        }
+
+        let original_path = if matches!(index_status, 'R' | 'C')
+            || matches!(worktree_status, 'R' | 'C')
+        {
+            let source_end = output[offset..]
+                .iter()
+                .position(|byte| *byte == b'\0')
+                .map(|position| offset + position)
+                .ok_or_else(|| {
+                    invalid_status(bench, "rename or copy record is missing its source path")
+                })?;
+            let source =
+                PathBuf::from(String::from_utf8_lossy(&output[offset..source_end]).into_owned());
+            offset = source_end + 1;
+            if source.as_os_str().is_empty() {
+                return Err(invalid_status(
+                    bench,
+                    "rename or copy record has an empty source path",
+                ));
+            }
+            Some(source)
+        } else {
+            None
+        };
+
+        files.push(DirtyFile {
+            index_status,
+            worktree_status,
+            path,
+            original_path,
+        });
+    }
+
+    Ok(WorktreeState::Dirty { files })
+}
+
+fn invalid_status(bench: &Path, message: &str) -> AdapterError {
+    AdapterError::InvalidStatus {
+        cwd: bench.to_path_buf(),
+        message: message.to_owned(),
+    }
+}
+
+fn is_status_code(status: char) -> bool {
+    matches!(
+        status,
+        ' ' | 'M' | 'T' | 'A' | 'D' | 'R' | 'C' | 'U' | '?' | '!'
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_worktree_state;
+    use crate::domain::WorktreeState;
+    use std::path::Path;
+
+    #[test]
+    fn parses_nul_delimited_dirty_files_and_rename_sources() {
+        let state = parse_worktree_state(
+            b"M  staged.txt\0 M unstaged.txt\0?? untracked.txt\0R  renamed.txt\0original.txt\0C  copied.txt\0source.txt\0",
+            Path::new("/bench"),
+        )
+        .expect("valid porcelain");
+
+        let WorktreeState::Dirty { files } = state else {
+            panic!("dirty output should produce files");
+        };
+        assert_eq!(files.len(), 5);
+        assert_eq!(files[0].index_status, 'M');
+        assert_eq!(files[1].worktree_status, 'M');
+        assert_eq!(files[2].path, Path::new("untracked.txt"));
+        assert_eq!(files[3].path, Path::new("renamed.txt"));
+        assert_eq!(
+            files[3].original_path.as_deref(),
+            Some(Path::new("original.txt"))
+        );
+        assert_eq!(files[4].path, Path::new("copied.txt"));
+        assert_eq!(
+            files[4].original_path.as_deref(),
+            Some(Path::new("source.txt"))
+        );
+    }
+
+    #[test]
+    fn rejects_a_rename_without_its_source_path() {
+        let error = parse_worktree_state(b"R  renamed.txt\0", Path::new("/bench"))
+            .expect_err("incomplete rename is invalid");
+
+        assert!(error.to_string().contains("source path"));
+    }
+
+    #[test]
+    fn rejects_an_invalid_porcelain_status_code() {
+        let error = parse_worktree_state(b"Z  invalid.txt\0", Path::new("/bench"))
+            .expect_err("unknown status code is invalid");
+
+        assert!(error.to_string().contains("not valid porcelain"));
     }
 }
 

@@ -40,4 +40,6 @@ pub enum AdapterError {
         cwd: PathBuf,
         source: serde_json::Error,
     },
+    #[error("could not parse git status output in {cwd}: {message}")]
+    InvalidStatus { cwd: PathBuf, message: String },
 }

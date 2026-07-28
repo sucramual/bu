@@ -8,6 +8,9 @@ _Code_: NEW ENTITY `BenchConfig`
 _Avoid_: clean branch
 _Code_: NEW ENTITY `BenchObservation`
 
+**Dirty file:** A staged, unstaged, untracked, renamed, or copied path reported by Git for a configured bench, including its index and worktree status.
+_Code_: NEW ENTITY `DirtyFile`
+
 **Feature branch:** The current attached local branch whose pull-request state determines whether a bench may be recycled.
 _Code_: Git symbolic ref represented in `BenchObservation`
 
