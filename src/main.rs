@@ -29,7 +29,11 @@ enum Command {
         color: ColorMode,
     },
     /// Recycle eligible benches after guarded rechecks.
-    Recycle,
+    Recycle {
+        /// Control ANSI styling in recycle output.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -77,9 +81,19 @@ fn run() -> Result<ExitCode, AppError> {
                 ExitCode::SUCCESS
             })
         }
-        Command::Recycle => {
+        Command::Recycle { color } => {
             let report = run_recycle(&config);
-            print!("{}", format_report(&report));
+            print!(
+                "{}",
+                format_report(
+                    &report,
+                    resolve_color(
+                        color,
+                        std::io::stdout().is_terminal(),
+                        std::env::var_os("NO_COLOR").is_some()
+                    ),
+                )
+            );
             Ok(if report.has_failures() {
                 ExitCode::from(1)
             } else {
