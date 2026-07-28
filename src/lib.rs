@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use adapters::{GitAdapter, GitHubAdapter};
 pub use domain::Config;
 pub use error::AppError;
-pub use report::{RunReport, format_report};
+pub use report::{RunReport, StatusFormat, format_report, format_status_report};
 
 pub fn load_config(path: Option<PathBuf>) -> Result<Config, AppError> {
     let path = path.unwrap_or(default_config_path()?);

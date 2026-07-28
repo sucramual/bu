@@ -1,0 +1,6 @@
+# ADR-001: Make status concise by default  [status: accepted]
+
+- **Context:** `docs/adr/bench-status-details-002.md` chose complete dirty-file output by default so one command supplied the full cleanup inventory. Once every bench also gained branch, state, and reason fields, that choice made the common multi-bench scan verbose. The approved uv/Ruff-inspired presentation adds an explicit verbose mode.
+- **Decision:** `bu status` prints one primary row per bench by default. `-v` and `--verbose` append every structured dirty-file entry, each full configured path, and full failure diagnostics. The domain keeps `SkipReason`; the status formatter groups those reasons into `blocked` and `idle` display roles.
+- **Alternatives:** Keeping complete details by default preserves the earlier behavior but leaves the scanability problem. An icon table is compact but makes icons carry more meaning and behaves poorly in narrow terminals.
+- **Consequences:** The default becomes fast to scan and verbose mode remains a complete cleanup and diagnostic view. This ADR supersedes the default-detail decision in `docs/adr/bench-status-details-002.md`; structured dirty-file parsing and escaping from `docs/adr/bench-status-details-001.md` remain unchanged.

@@ -1,8 +1,12 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bu::{AppError, format_report, load_config, run_recycle, run_status};
-use clap::{Parser, Subcommand};
+use bu::{
+    AppError, StatusFormat, format_report, format_status_report, load_config, run_recycle,
+    run_status,
+};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(about = "Report and safely recycle configured Git worktree benches")]
@@ -16,9 +20,24 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Report configured benches without changing Git state.
-    Status,
+    Status {
+        /// Include full bench paths, dirty files, and failure diagnostics.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Control ANSI styling in status output.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+    },
     /// Recycle eligible benches after guarded rechecks.
     Recycle,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 fn main() -> ExitCode {
@@ -36,9 +55,22 @@ fn run() -> Result<ExitCode, AppError> {
     let config = load_config(cli.config)?;
 
     match cli.command {
-        Command::Status => {
+        Command::Status { verbose, color } => {
             let report = run_status(&config);
-            print!("{}", format_report(&report));
+            print!(
+                "{}",
+                format_status_report(
+                    &report,
+                    StatusFormat {
+                        verbose,
+                        use_color: resolve_color(
+                            color,
+                            std::io::stdout().is_terminal(),
+                            std::env::var_os("NO_COLOR").is_some()
+                        ),
+                    },
+                )
+            );
             Ok(if report.has_failures() {
                 ExitCode::from(1)
             } else {
@@ -54,5 +86,13 @@ fn run() -> Result<ExitCode, AppError> {
                 ExitCode::SUCCESS
             })
         }
+    }
+}
+
+fn resolve_color(mode: ColorMode, stdout_is_terminal: bool, no_color: bool) -> bool {
+    match mode {
+        ColorMode::Auto => stdout_is_terminal && !no_color,
+        ColorMode::Always => true,
+        ColorMode::Never => false,
     }
 }
