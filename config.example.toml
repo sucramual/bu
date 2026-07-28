@@ -1,0 +1,8 @@
+[repository]
+path = "/Users/you/Documents/multiplier"
+remote = "origin"
+main_branch = "main"
+
+[[benches]]
+path = "/Users/you/Documents/multiplier-01"
+standin_branch = "main-01"
