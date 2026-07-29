@@ -1,6 +1,6 @@
 # bu
 
-`bu` reports and safely recycles explicitly configured Multiplier worktree benches.
+`bu` reports and safely recycles explicitly configured Git worktree benches.
 
 ## Commands
 
@@ -22,12 +22,12 @@ Copy [`config.example.toml`](config.example.toml) to `~/.config/bu/config.toml` 
 
 ```toml
 [repository]
-path = "/Users/you/Documents/multiplier"
+path = "/Users/you/Documents/example-repo"
 remote = "origin"
 main_branch = "main"
 
 [[benches]]
-path = "/Users/you/Documents/multiplier-01"
+path = "/Users/you/Documents/example-repo-01"
 standin_branch = "main-01"
 ```
 
