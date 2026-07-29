@@ -399,7 +399,8 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                 observation,
                 decision,
             } => {
-                let (role, reason) = recycle_observed_role_and_reason(observation, decision);
+                let (role, reason) =
+                    observed_role_and_reason(observation, decision, StatusRole::Skipped);
                 match role {
                     StatusRole::Blocked => blocked += 1,
                     StatusRole::Skipped => skipped += 1,
@@ -434,7 +435,10 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                 );
             }
             RunItem::Failed {
-                branch, summary, ..
+                branch,
+                summary,
+                error,
+                ..
             } => {
                 failed += 1;
                 write_status_row(
@@ -445,6 +449,7 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                     summary,
                     use_color,
                 );
+                let _ = writeln!(formatted, "    error: {error}");
             }
         }
     }
@@ -486,7 +491,8 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
                 observation,
                 decision,
             } => {
-                let (role, reason) = status_observed_role_and_reason(observation, decision);
+                let (role, reason) =
+                    observed_role_and_reason(observation, decision, StatusRole::Idle);
                 write_status_row(
                     &mut formatted,
                     role,
@@ -625,9 +631,10 @@ fn item_bench_path(item: &RunItem) -> String {
     }
 }
 
-fn status_observed_role_and_reason(
+fn observed_role_and_reason(
     observation: &BenchObservation,
     decision: &BenchDecision,
+    settled_role: StatusRole,
 ) -> (StatusRole, String) {
     match decision {
         BenchDecision::Eligible { pull_request, .. } => (
@@ -636,37 +643,7 @@ fn status_observed_role_and_reason(
         ),
         BenchDecision::Skip(reason) => {
             let role = match reason {
-                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => {
-                    StatusRole::Idle
-                }
-                _ => StatusRole::Blocked,
-            };
-            let description = match (&observation.worktree, reason) {
-                (WorktreeState::Dirty { files }, SkipReason::DirtyWorktree) => {
-                    let file_word = if files.len() == 1 { "file" } else { "files" };
-                    format!("dirty worktree ({} {file_word})", files.len())
-                }
-                _ => format_skip_reason(reason),
-            };
-            (role, description)
-        }
-    }
-}
-
-fn recycle_observed_role_and_reason(
-    observation: &BenchObservation,
-    decision: &BenchDecision,
-) -> (StatusRole, String) {
-    match decision {
-        BenchDecision::Eligible { pull_request, .. } => (
-            StatusRole::Eligible,
-            format!("merged pull request #{pull_request}"),
-        ),
-        BenchDecision::Skip(reason) => {
-            let role = match reason {
-                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => {
-                    StatusRole::Skipped
-                }
+                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => settled_role,
                 _ => StatusRole::Blocked,
             };
             let description = match (&observation.worktree, reason) {

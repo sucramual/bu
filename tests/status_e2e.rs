@@ -352,9 +352,12 @@ fn recycle_fetch_failure_leaves_the_bench_unchanged() {
     let output = recycle(&config, &fake_bin);
 
     assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("▎ failed   repository unknown upstream fetch failed"));
+    assert!(stdout.contains("    error: could not fetch upstream main before recycling:"));
     assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("▎ failed   repository unknown upstream fetch failed")
+        stdout.contains("git fetch [\"fetch\", \"--no-tags\", \"missing\""),
+        "{stdout}"
     );
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
