@@ -1,8 +1,8 @@
 [repository]
-path = "/Users/you/Documents/multiplier"
+path = "/Users/you/Documents/example-repo"
 remote = "origin"
 main_branch = "main"
 
 [[benches]]
-path = "/Users/you/Documents/multiplier-01"
+path = "/Users/you/Documents/example-repo-01"
 standin_branch = "main-01"

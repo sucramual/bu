@@ -757,13 +757,13 @@ mod tests {
         let report = RunReport {
             items: vec![
                 RunItem::Failed {
-                    bench: "/benches/one/multiplier-01".to_owned(),
+                    bench: "/benches/one/example-repo-01".to_owned(),
                     branch: None,
                     summary: "repository check failed",
                     error: "first failure".to_owned(),
                 },
                 RunItem::Failed {
-                    bench: "/benches/two/multiplier-01".to_owned(),
+                    bench: "/benches/two/example-repo-01".to_owned(),
                     branch: None,
                     summary: "repository check failed",
                     error: "second failure".to_owned(),
@@ -774,8 +774,8 @@ mod tests {
         assert_eq!(
             status_labels(&report),
             [
-                "/benches/one/multiplier-01".to_owned(),
-                "/benches/two/multiplier-01".to_owned(),
+                "/benches/one/example-repo-01".to_owned(),
+                "/benches/two/example-repo-01".to_owned(),
             ]
         );
     }
