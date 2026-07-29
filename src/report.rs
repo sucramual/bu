@@ -385,67 +385,85 @@ fn observation_failure(
     }
 }
 
-pub fn format_report(report: &RunReport) -> String {
+pub fn format_report(report: &RunReport, use_color: bool) -> String {
     let mut formatted = String::new();
-    let mut eligible = 0;
+    let labels = status_labels(report);
     let mut recycled = 0;
+    let mut blocked = 0;
     let mut skipped = 0;
     let mut failed = 0;
 
-    for item in &report.items {
+    for (index, item) in report.items.iter().enumerate() {
         match item {
             RunItem::Observed {
                 observation,
                 decision,
             } => {
-                let (status, reason) = match decision {
-                    BenchDecision::Eligible { pull_request, .. } => {
-                        eligible += 1;
-                        ("eligible", format!("merged pull request #{pull_request}"))
-                    }
-                    BenchDecision::Skip(reason) => {
-                        skipped += 1;
-                        ("skipped", format_skip_reason(reason))
-                    }
-                };
-                write_observed_block(&mut formatted, observation, status, &reason);
+                let (role, reason) =
+                    observed_role_and_reason(observation, decision, StatusRole::Skipped);
+                match role {
+                    StatusRole::Blocked => blocked += 1,
+                    StatusRole::Skipped => skipped += 1,
+                    StatusRole::Eligible
+                    | StatusRole::Idle
+                    | StatusRole::Recycled
+                    | StatusRole::Failed => {}
+                }
+                write_status_row(
+                    &mut formatted,
+                    role,
+                    &labels[index],
+                    branch_name(&observation.branch),
+                    &reason,
+                    use_color,
+                );
             }
             RunItem::Recycled {
-                bench,
                 previous_branch,
                 standin_branch,
                 upstream_commit,
+                ..
             } => {
                 recycled += 1;
-                write_block(
+                write_status_row(
                     &mut formatted,
-                    bench,
-                    Some(standin_branch),
-                    "recycled",
+                    StatusRole::Recycled,
+                    &labels[index],
+                    standin_branch,
                     &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
+                    use_color,
                 );
             }
             RunItem::Failed {
-                bench,
                 branch,
-                summary: _,
+                summary,
                 error,
+                ..
             } => {
                 failed += 1;
-                write_block(
+                write_status_row(
                     &mut formatted,
-                    bench,
-                    branch.as_ref().map(branch_name),
-                    "failed",
-                    error,
+                    StatusRole::Failed,
+                    &labels[index],
+                    branch.as_ref().map(branch_name).unwrap_or("unknown"),
+                    summary,
+                    use_color,
                 );
+                let _ = writeln!(formatted, "    error: {error}");
             }
         }
     }
 
+    let bench_word = if report.items.len() == 1 {
+        "bench"
+    } else {
+        "benches"
+    };
+    let _ = writeln!(formatted);
+    let _ = writeln!(formatted, "Checked {} {bench_word}", report.items.len());
     let _ = writeln!(
         formatted,
-        "summary: {eligible} eligible, {recycled} recycled, {skipped} skipped, {failed} failed"
+        "{recycled} recycled, {blocked} blocked, {skipped} skipped, {failed} failed"
     );
     formatted
 }
@@ -473,7 +491,8 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
                 observation,
                 decision,
             } => {
-                let (role, reason) = status_observed_role_and_reason(observation, decision);
+                let (role, reason) =
+                    observed_role_and_reason(observation, decision, StatusRole::Idle);
                 write_status_row(
                     &mut formatted,
                     role,
@@ -546,6 +565,8 @@ enum StatusRole {
     Eligible,
     Blocked,
     Idle,
+    Recycled,
+    Skipped,
     Failed,
 }
 
@@ -555,6 +576,8 @@ impl StatusRole {
             Self::Eligible => "eligible",
             Self::Blocked => "blocked",
             Self::Idle => "idle",
+            Self::Recycled => "recycled",
+            Self::Skipped => "skipped",
             Self::Failed => "failed",
         }
     }
@@ -564,6 +587,8 @@ impl StatusRole {
             Self::Eligible => "\x1b[36m",
             Self::Blocked => "\x1b[33m",
             Self::Idle => "\x1b[2;90m",
+            Self::Recycled => "\x1b[32m",
+            Self::Skipped => "\x1b[2;90m",
             Self::Failed => "\x1b[31m",
         }
     }
@@ -606,9 +631,10 @@ fn item_bench_path(item: &RunItem) -> String {
     }
 }
 
-fn status_observed_role_and_reason(
+fn observed_role_and_reason(
     observation: &BenchObservation,
     decision: &BenchDecision,
+    settled_role: StatusRole,
 ) -> (StatusRole, String) {
     match decision {
         BenchDecision::Eligible { pull_request, .. } => (
@@ -617,9 +643,7 @@ fn status_observed_role_and_reason(
         ),
         BenchDecision::Skip(reason) => {
             let role = match reason {
-                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => {
-                    StatusRole::Idle
-                }
+                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => settled_role,
                 _ => StatusRole::Blocked,
             };
             let description = match (&observation.worktree, reason) {
@@ -681,60 +705,8 @@ fn write_status_details(formatted: &mut String, observation: &BenchObservation) 
     }
 }
 
-fn write_observed_block(
-    formatted: &mut String,
-    observation: &BenchObservation,
-    status: &str,
-    reason: &str,
-) {
-    write_block(
-        formatted,
-        &observation.bench.path.display().to_string(),
-        Some(branch_name(&observation.branch)),
-        status,
-        reason,
-    );
-    if let WorktreeState::Dirty { files } = &observation.worktree {
-        let _ = writeln!(formatted, "  dirty:");
-        for file in files {
-            let path = format_path(&file.path);
-            match &file.original_path {
-                Some(original_path) => {
-                    let _ = writeln!(
-                        formatted,
-                        "    {}{} {} -> {path}",
-                        file.index_status,
-                        file.worktree_status,
-                        format_path(original_path),
-                    );
-                }
-                None => {
-                    let _ = writeln!(
-                        formatted,
-                        "    {}{} {path}",
-                        file.index_status, file.worktree_status,
-                    );
-                }
-            }
-        }
-    }
-}
-
 fn format_path(path: &std::path::Path) -> String {
     path.to_string_lossy().escape_default().to_string()
-}
-
-fn write_block(
-    formatted: &mut String,
-    bench: &str,
-    branch: Option<&str>,
-    status: &str,
-    reason: &str,
-) {
-    let _ = writeln!(formatted, "{bench}");
-    let _ = writeln!(formatted, "  branch: {}", branch.unwrap_or("unknown"));
-    let _ = writeln!(formatted, "  status: {status}");
-    let _ = writeln!(formatted, "  reason: {reason}");
 }
 
 fn branch_name(branch: &CurrentBranch) -> &str {

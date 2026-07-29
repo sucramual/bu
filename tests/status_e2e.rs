@@ -137,6 +137,15 @@ fn status_with(
 }
 
 fn recycle(config: &Path, fake_bin: &Path) -> Output {
+    recycle_with(config, fake_bin, &[], &[])
+}
+
+fn recycle_with(
+    config: &Path,
+    fake_bin: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Output {
     let original_path = env::var_os("PATH").expect("PATH is set");
     let path = env::join_paths(
         std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&original_path)),
@@ -146,7 +155,9 @@ fn recycle(config: &Path, fake_bin: &Path) -> Output {
         .args(["--config"])
         .arg(config)
         .arg("recycle")
+        .args(arguments)
         .env("PATH", path)
+        .envs(environment.iter().copied())
         .output()
         .expect("bu should start")
 }
@@ -265,10 +276,9 @@ fn recycle_fast_forwards_the_standin_and_preserves_the_feature_ref() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("  branch: main-01\n  status: recycled\n  reason: feature/merged preserved")
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("▎ recycled repository main-01 feature/merged preserved; main-01 -> "));
+    assert!(stdout.contains("\n1 recycled, 0 blocked, 0 skipped, 0 failed\n"));
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
         "main-01"
@@ -285,7 +295,41 @@ fn recycle_fast_forwards_the_standin_and_preserves_the_feature_ref() {
 
     let second = recycle(&config, &fake_bin);
     assert!(second.status.success());
-    assert!(String::from_utf8_lossy(&second.stdout).contains("0 recycled"));
+    assert!(
+        String::from_utf8_lossy(&second.stdout)
+            .contains("0 recycled, 0 blocked, 1 skipped, 0 failed")
+    );
+}
+
+#[test]
+fn recycle_color_policy_styles_only_the_marker_and_honors_overrides() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+
+    let always = recycle_with(
+        &config,
+        &fake_bin,
+        &["--color", "always"],
+        &[("NO_COLOR", "1")],
+    );
+    assert!(always.status.success());
+    let always_stdout = String::from_utf8_lossy(&always.stdout);
+    assert!(always_stdout.contains("\x1b[32m▎\x1b[0m recycled repository"));
+    assert_eq!(always_stdout.matches('\x1b').count(), 2);
+
+    let never = recycle_with(
+        &config,
+        &fake_bin,
+        &["--color", "never"],
+        &[("NO_COLOR", "1")],
+    );
+    assert!(never.status.success());
+    assert!(!String::from_utf8_lossy(&never.stdout).contains('\x1b'));
 }
 
 #[test]
@@ -308,7 +352,13 @@ fn recycle_fetch_failure_leaves_the_bench_unchanged() {
     let output = recycle(&config, &fake_bin);
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("could not fetch upstream main"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("▎ failed   repository unknown upstream fetch failed"));
+    assert!(stdout.contains("    error: could not fetch upstream main before recycling:"));
+    assert!(
+        stdout.contains("git fetch [\"fetch\", \"--no-tags\", \"missing\""),
+        "{stdout}"
+    );
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
@@ -340,14 +390,9 @@ fn recycle_continues_after_one_bench_fails() {
     let output = recycle(&config, &fake_bin);
 
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("missing-bench\n  branch: unknown\n  status: failed")
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("  status: recycled\n  reason: feature/merged preserved")
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("▎ failed   missing-bench unknown repository check failed"));
+    assert!(stdout.contains("▎ recycled repository main-01 feature/merged preserved"));
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
         "main-01"
@@ -401,7 +446,7 @@ fn recycle_skips_a_bench_already_on_its_standin_branch() {
     assert!(output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stdout)
-            .contains("  status: skipped\n  reason: already on the stand-in branch")
+            .contains("▎ skipped  repository main-01 already on the stand-in branch")
     );
     assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
     assert_eq!(

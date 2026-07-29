@@ -9,11 +9,12 @@ bu status
 bu status --verbose
 bu status --color auto|always|never
 bu recycle
+bu recycle --color auto|always|never
 ```
 
-`status` is read-only. By default it prints one concise row per bench and a summary. Use `-v` or `--verbose` for configured paths, structured dirty files, and complete failure diagnostics. Status styling colors only the leading marker; `auto` (the default) uses color only on a terminal without `NO_COLOR`, while `always` and `never` override that policy.
+`status` is read-only. By default it prints one concise row per bench and a summary. Use `-v` or `--verbose` for configured paths, structured dirty files, and complete failure diagnostics. Status and recycle styling color only the leading marker; `auto` (the default) uses color only on a terminal without `NO_COLOR`, while `always` and `never` override that policy.
 
-`recycle` fetches the configured upstream once, then mutates only benches that pass every safety check.
+`recycle` fetches the configured upstream once, then mutates only benches that pass every safety check. Failed rows include the detailed diagnostic needed to understand the state and recover safely.
 
 ## Configuration
 
