@@ -1,21 +1,22 @@
 use std::path::PathBuf;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub repository: RepositoryConfig,
+    #[serde(default)]
     pub benches: Vec<BenchConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RepositoryConfig {
     pub path: PathBuf,
     pub remote: String,
     pub main_branch: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BenchConfig {
     pub path: PathBuf,
     pub standin_branch: String,

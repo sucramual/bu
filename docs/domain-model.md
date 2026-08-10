@@ -1,10 +1,10 @@
 # `bu` domain model
 
-**Bench:** A configured durable Git worktree paired with one stand-in branch.
+**Bench:** A durable Git worktree paired with one stand-in branch. The default config discovers numbered sibling benches, while explicit config files list them directly.
 _Avoid_: branch, work bench
 _Code_: NEW ENTITY `BenchConfig`
 
-**Worktree cleanliness:** The absence of staged, unstaged, and untracked changes in a configured bench.
+**Worktree cleanliness:** The absence of staged, unstaged, and untracked changes in a managed bench.
 _Avoid_: clean branch
 _Code_: NEW ENTITY `BenchObservation`
 
@@ -14,7 +14,7 @@ _Code_: NEW ENTITY `DirtyFile`
 **Feature branch:** The current attached local branch whose pull-request state determines whether a bench may be recycled.
 _Code_: Git symbolic ref represented in `BenchObservation`
 
-**Stand-in branch:** The configured long-lived `main-NN` branch that represents `main` for one durable bench.
+**Stand-in branch:** The long-lived `main-NN` branch that represents `main` for one durable bench.
 _Avoid_: feature branch, bench branch
 _Code_: NEW ENTITY `BenchConfig.standin_branch`
 

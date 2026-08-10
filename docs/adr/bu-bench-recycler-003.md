@@ -1,6 +1,6 @@
 # ADR-003: Configure every managed bench explicitly
 
-### ADR-003: Configure every managed bench explicitly [status: accepted]
+### ADR-003: Configure every managed bench explicitly [status: superseded by ADR-004]
 
 - **Context:** The target repository has durable benches alongside many temporary Codex, Claude, and Cheese worktrees. Scanning every Git worktree would include unmanaged targets.
 - **Decision:** `~/.config/bu/config.toml` explicitly maps the repository and every managed bench path to its `main-NN` stand-in branch.

@@ -9,7 +9,7 @@ use bu::{
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(about = "Report and safely recycle configured Git worktree benches")]
+#[command(about = "Report and safely recycle durable Git worktree benches")]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -19,7 +19,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Report configured benches without changing Git state.
+    /// Report managed benches without changing Git state.
     Status {
         /// Include full bench paths, dirty files, and failure diagnostics.
         #[arg(short, long)]

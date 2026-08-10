@@ -64,6 +64,12 @@ fn unexpected_exit(program: &str, cwd: &Path, output: CommandOutput) -> AdapterE
 
 pub struct GitAdapter;
 
+#[derive(Debug)]
+pub struct GitWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
 impl GitAdapter {
     pub fn new() -> Self {
         Self
@@ -84,6 +90,19 @@ impl GitAdapter {
 
     pub fn same_repository(&self, repository: &Path, bench: &Path) -> Result<bool, AdapterError> {
         Ok(self.git_common_dir(repository)? == self.git_common_dir(bench)?)
+    }
+
+    pub fn worktrees(&self, repository: &Path) -> Result<Vec<GitWorktree>, AdapterError> {
+        let output = run_command(
+            repository,
+            "git",
+            &arguments(&["worktree", "list", "--porcelain"]),
+        )?;
+        if !output.success {
+            return Err(unexpected_exit("git worktree list", repository, output));
+        }
+
+        parse_worktrees(&output.stdout, repository)
     }
 
     pub fn current_branch(&self, bench: &Path) -> Result<CurrentBranch, AdapterError> {
@@ -320,6 +339,27 @@ impl GitAdapter {
         }
         Ok(None)
     }
+}
+
+fn parse_worktrees(output: &str, repository: &Path) -> Result<Vec<GitWorktree>, AdapterError> {
+    let mut worktrees = Vec::new();
+    for record in output.split("\n\n").filter(|record| !record.is_empty()) {
+        let mut path = None;
+        let mut branch = None;
+        for line in record.lines() {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(value));
+            } else if let Some(value) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(value.to_owned());
+            }
+        }
+        let path = path.ok_or_else(|| AdapterError::InvalidWorktreeList {
+            cwd: repository.to_path_buf(),
+            message: "record is missing its worktree path".to_owned(),
+        })?;
+        worktrees.push(GitWorktree { path, branch });
+    }
+    Ok(worktrees)
 }
 
 fn parse_worktree_state(output: &[u8], bench: &Path) -> Result<WorktreeState, AdapterError> {

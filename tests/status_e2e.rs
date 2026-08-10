@@ -110,6 +110,49 @@ fn merged_pull_request_body(branch: &str, head_commit: &str) -> String {
     )
 }
 
+fn matching_merged_pull_request_body() -> &'static str {
+    r#"head=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--head" ]; then
+    shift
+    head="$1"
+  fi
+  shift
+done
+oid=$(git rev-parse "$head")
+printf '[{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"%s"}]\n' "$head" "$oid""#
+}
+
+fn add_numbered_bench(repository: &Path, slot: &str, feature_branch: &str) -> std::path::PathBuf {
+    let repository_name = repository
+        .file_name()
+        .expect("repository name")
+        .to_string_lossy();
+    let bench = repository
+        .parent()
+        .expect("repository parent")
+        .join(format!("{repository_name}-{slot}"));
+    let standin_branch = format!("main-{slot}");
+    if git(repository, &["branch", "--list", &standin_branch])
+        .trim()
+        .is_empty()
+    {
+        git(repository, &["branch", &standin_branch]);
+    }
+    git(
+        repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            feature_branch,
+            bench.to_str().expect("bench path is UTF-8"),
+            "main",
+        ],
+    );
+    bench
+}
+
 fn status(config: &Path, fake_bin: &Path) -> Output {
     status_with(config, fake_bin, &[], &[])
 }
@@ -132,6 +175,21 @@ fn status_with(
         .args(arguments)
         .env("PATH", path)
         .envs(environment.iter().copied())
+        .output()
+        .expect("bu should start")
+}
+
+fn status_with_default_config(repository: &Path, home: &Path, fake_bin: &Path) -> Output {
+    let original_path = env::var_os("PATH").expect("PATH is set");
+    let path = env::join_paths(
+        std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&original_path)),
+    )
+    .expect("valid PATH");
+    Command::new(env!("CARGO_BIN_EXE_bu"))
+        .arg("status")
+        .current_dir(repository)
+        .env("HOME", home)
+        .env("PATH", path)
         .output()
         .expect("bu should start")
 }
@@ -160,6 +218,61 @@ fn recycle_with(
         .envs(environment.iter().copied())
         .output()
         .expect("bu should start")
+}
+
+#[test]
+fn default_config_is_created_and_updated_from_numbered_sibling_benches() {
+    let (temporary, repository) = fixture_repository();
+    git(&repository, &["switch", "main"]);
+    let first_bench = add_numbered_bench(&repository, "01", "feature/one");
+    let wrong_width_bench =
+        add_numbered_bench(&repository, "20260810", "feature/date-stamped-scratch");
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).expect("home directory");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let first = status_with_default_config(&first_bench, &home, &fake_bin);
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("Checked 1 bench"));
+    let config_path = home.join(".config/bu/config.toml");
+    let first_config = fs::read_to_string(&config_path).expect("generated config");
+    assert!(first_config.contains(&first_bench.display().to_string()));
+    assert!(!first_config.contains(&wrong_width_bench.display().to_string()));
+
+    let second_bench = add_numbered_bench(&repository, "02", "feature/two");
+    let scratch = repository
+        .parent()
+        .expect("repository parent")
+        .join("scratch-worktree");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/scratch",
+            scratch.to_str().expect("scratch path is UTF-8"),
+            "main",
+        ],
+    );
+
+    let second = status_with_default_config(&repository, &home, &fake_bin);
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(String::from_utf8_lossy(&second.stdout).contains("Checked 2 benches"));
+    let updated_config = fs::read_to_string(&config_path).expect("updated config");
+    assert!(updated_config.contains(&first_bench.display().to_string()));
+    assert!(updated_config.contains(&second_bench.display().to_string()));
+    assert!(!updated_config.contains(&scratch.display().to_string()));
 }
 
 #[test]
