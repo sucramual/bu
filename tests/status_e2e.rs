@@ -227,6 +227,27 @@ fn default_config_is_created_and_updated_from_numbered_sibling_benches() {
     let first_bench = add_numbered_bench(&repository, "01", "feature/one");
     let wrong_width_bench =
         add_numbered_bench(&repository, "20260810", "feature/date-stamped-scratch");
+    let repository_name = repository
+        .file_name()
+        .expect("repository name")
+        .to_string_lossy();
+    let newline_scratch = repository
+        .parent()
+        .expect("repository parent")
+        .join(format!("{repository_name}-03\nscratch"));
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/newline-scratch",
+            newline_scratch
+                .to_str()
+                .expect("newline scratch path is UTF-8"),
+            "main",
+        ],
+    );
     let home = temporary.path().join("home");
     fs::create_dir(&home).expect("home directory");
     let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
@@ -243,6 +264,7 @@ fn default_config_is_created_and_updated_from_numbered_sibling_benches() {
     let first_config = fs::read_to_string(&config_path).expect("generated config");
     assert!(first_config.contains(&first_bench.display().to_string()));
     assert!(!first_config.contains(&wrong_width_bench.display().to_string()));
+    assert!(!first_config.contains(&format!("{repository_name}-03")));
 
     let second_bench = add_numbered_bench(&repository, "02", "feature/two");
     let scratch = repository
