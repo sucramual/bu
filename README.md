@@ -16,6 +16,16 @@ bu recycle --color auto|always|never
 
 `recycle` fetches the configured upstream once, then mutates only benches that pass every safety check. Failed rows include the detailed diagnostic needed to understand the state and recover safely.
 
+## Installation and updates
+
+Install `bu` from this checkout:
+
+```text
+cargo install --path . --force
+```
+
+Cargo copies the executable into its binary directory, normally `~/.cargo/bin`; it does not link the command to this checkout. After `git pull`, rerun the install command when the pull changes source code or dependencies. Documentation-, test-, and example-only changes do not require reinstalling it.
+
 ## Configuration
 
 Copy [`config.example.toml`](config.example.toml) to `~/.config/bu/config.toml` and list only the durable benches that `bu` may manage. Each bench maps to its own long-lived `main-NN` stand-in branch.
