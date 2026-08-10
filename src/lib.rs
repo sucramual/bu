@@ -5,6 +5,7 @@ mod report;
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use adapters::{GitAdapter, GitHubAdapter};
@@ -16,18 +17,28 @@ pub use report::{RunReport, StatusFormat, format_report, format_status_report};
 pub fn load_config(path: Option<PathBuf>) -> Result<Config, AppError> {
     let is_default = path.is_none();
     let path = path.unwrap_or(default_config_path()?);
-    if is_default && !path.exists() {
-        return create_default_config(&path);
-    }
-
-    let source = read_config_source(&path)?;
+    let source = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(source) if is_default && source.kind() == std::io::ErrorKind::NotFound => {
+            return create_default_config(&path);
+        }
+        Err(source) => {
+            return Err(AppError::ConfigRead {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
     let mut config: Config = toml::from_str(&source).map_err(|source| AppError::ConfigParse {
         path: path.clone(),
         source,
     })?;
 
-    if is_default && add_discovered_benches(&mut config)? {
-        write_config(&path, &config)?;
+    if is_default {
+        let discovered = add_discovered_benches(&mut config)?;
+        if !discovered.is_empty() {
+            append_benches(&path, &source, &discovered)?;
+        }
     }
 
     Ok(config)
@@ -43,12 +54,11 @@ fn create_default_config(path: &Path) -> Result<Config, AppError> {
             message: error.to_string(),
         })?;
     let repository = worktrees
-        .iter()
-        .find(|worktree| worktree.branch.as_deref() == Some("main"))
+        .first()
         .map(|worktree| worktree.path.clone())
         .ok_or_else(|| AppError::ConfigDiscovery {
             path: cwd,
-            message: "the repository has no worktree on the main branch".to_owned(),
+            message: "the repository has no primary worktree".to_owned(),
         })?;
     let mut config = Config {
         repository: RepositoryConfig {
@@ -63,14 +73,7 @@ fn create_default_config(path: &Path) -> Result<Config, AppError> {
     Ok(config)
 }
 
-fn read_config_source(path: &Path) -> Result<String, AppError> {
-    fs::read_to_string(path).map_err(|source| AppError::ConfigRead {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn add_discovered_benches(config: &mut Config) -> Result<bool, AppError> {
+fn add_discovered_benches(config: &mut Config) -> Result<Vec<BenchConfig>, AppError> {
     let git = GitAdapter::new();
     let worktrees =
         git.worktrees(&config.repository.path)
@@ -81,9 +84,12 @@ fn add_discovered_benches(config: &mut Config) -> Result<bool, AppError> {
     Ok(add_benches_from_worktrees(config, &worktrees))
 }
 
-fn add_benches_from_worktrees(config: &mut Config, worktrees: &[adapters::GitWorktree]) -> bool {
+fn add_benches_from_worktrees(
+    config: &mut Config,
+    worktrees: &[adapters::GitWorktree],
+) -> Vec<BenchConfig> {
     let Some(parent) = config.repository.path.parent() else {
-        return false;
+        return Vec::new();
     };
     let Some(repository_name) = config
         .repository
@@ -91,7 +97,7 @@ fn add_benches_from_worktrees(config: &mut Config, worktrees: &[adapters::GitWor
         .file_name()
         .and_then(|name| name.to_str())
     else {
-        return false;
+        return Vec::new();
     };
     let prefix = format!("{repository_name}-");
     let mut discovered: Vec<_> = worktrees
@@ -113,17 +119,17 @@ fn add_benches_from_worktrees(config: &mut Config, worktrees: &[adapters::GitWor
         .collect();
     discovered.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let original_len = config.benches.len();
-    for bench in discovered {
-        if !config
-            .benches
-            .iter()
-            .any(|configured| configured.path == bench.path)
-        {
-            config.benches.push(bench);
-        }
-    }
-    config.benches.len() != original_len
+    let new_benches: Vec<_> = discovered
+        .into_iter()
+        .filter(|bench| {
+            !config
+                .benches
+                .iter()
+                .any(|configured| configured.path == bench.path)
+        })
+        .collect();
+    config.benches.extend(new_benches.iter().cloned());
+    new_benches
 }
 
 fn write_config(path: &Path, config: &Config) -> Result<(), AppError> {
@@ -131,7 +137,45 @@ fn write_config(path: &Path, config: &Config) -> Result<(), AppError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let Some(parent) = path.parent() else {
+    write_config_source(path, &source)
+}
+
+fn append_benches(path: &Path, source: &str, benches: &[BenchConfig]) -> Result<(), AppError> {
+    let mut updated = source.to_owned();
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for bench in benches {
+        updated.push('\n');
+        updated.push_str("[[benches]]\n");
+        updated.push_str(&toml::to_string_pretty(bench).map_err(|source| {
+            AppError::ConfigSerialize {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?);
+    }
+    write_config_source(path, &updated)
+}
+
+fn write_config_source(path: &Path, source: &str) -> Result<(), AppError> {
+    let destination = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::canonicalize(path).map_err(|source| AppError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            })?
+        }
+        Ok(_) => path.to_path_buf(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(source) => {
+            return Err(AppError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let Some(parent) = destination.parent() else {
         return Err(AppError::ConfigWrite {
             path: path.to_path_buf(),
             source: std::io::Error::new(
@@ -144,10 +188,33 @@ fn write_config(path: &Path, config: &Config) -> Result<(), AppError> {
         path: path.to_path_buf(),
         source,
     })?;
-    fs::write(path, source).map_err(|source| AppError::ConfigWrite {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| AppError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if let Ok(metadata) = fs::metadata(&destination) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|source| AppError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    temporary
+        .write_all(source.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|source| AppError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist(&destination)
+        .map_err(|source| AppError::ConfigWrite {
+            path: path.to_path_buf(),
+            source: source.error,
+        })?;
 
     Ok(())
 }
