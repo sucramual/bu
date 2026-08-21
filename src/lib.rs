@@ -159,22 +159,7 @@ fn append_benches(path: &Path, source: &str, benches: &[BenchConfig]) -> Result<
 }
 
 fn write_config_source(path: &Path, source: &str) -> Result<(), AppError> {
-    let destination = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::canonicalize(path).map_err(|source| AppError::ConfigWrite {
-                path: path.to_path_buf(),
-                source,
-            })?
-        }
-        Ok(_) => path.to_path_buf(),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
-        Err(source) => {
-            return Err(AppError::ConfigWrite {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    };
+    let destination = config_destination(path)?;
     let Some(parent) = destination.parent() else {
         return Err(AppError::ConfigWrite {
             path: path.to_path_buf(),
@@ -217,6 +202,41 @@ fn write_config_source(path: &Path, source: &str) -> Result<(), AppError> {
         })?;
 
     Ok(())
+}
+
+fn config_destination(path: &Path) -> Result<PathBuf, AppError> {
+    let mut destination = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target =
+                    fs::read_link(&destination).map_err(|source| AppError::ConfigWrite {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                destination = if target.is_absolute() {
+                    target
+                } else {
+                    destination
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(target)
+                };
+            }
+            Ok(_) => return Ok(destination),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(destination),
+            Err(source) => {
+                return Err(AppError::ConfigWrite {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    }
+    Err(AppError::ConfigWrite {
+        path: path.to_path_buf(),
+        source: std::io::Error::other("too many config symlinks"),
+    })
 }
 
 pub fn run_status(config: &Config) -> RunReport {

@@ -250,6 +250,114 @@ fn default_config_uses_primary_checkout_when_main_is_not_checked_out() {
 }
 
 #[test]
+fn default_config_adds_a_bench_after_an_empty_first_run() {
+    let (temporary, repository) = fixture_repository();
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).expect("home directory");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let first = status_with_default_config(&repository, &home, &fake_bin);
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let config_path = home.join(".config/bu/config.toml");
+    let first_config = fs::read_to_string(&config_path).expect("generated config");
+    assert!(!first_config.contains("benches = []"));
+    let first_parsed: bu::Config = toml::from_str(&first_config).expect("generated config parses");
+    assert!(first_parsed.benches.is_empty());
+
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let second = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let updated_config = fs::read_to_string(&config_path).expect("updated config");
+    let updated: bu::Config = toml::from_str(&updated_config).expect("updated config parses");
+    assert_eq!(updated.benches.len(), 1);
+
+    let third = status_with_default_config(&bench, &home, &fake_bin);
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+}
+
+#[test]
+fn default_config_creates_the_target_of_a_dangling_symlink() {
+    let (temporary, repository) = fixture_repository();
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let home = temporary.path().join("home");
+    let config_path = home.join(".config/bu/config.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
+    let target = home.join("dotfiles/bu/config.toml");
+    symlink(&target, &config_path).expect("dangling default config link");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let output = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&config_path)
+            .expect("default config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    let config = fs::read_to_string(&target).expect("symlink target config");
+    let parsed: bu::Config = toml::from_str(&config).expect("symlink target config parses");
+    assert_eq!(parsed.benches.len(), 1);
+}
+
+#[test]
+fn default_config_preserves_chained_symlinks_to_a_dangling_target() {
+    let (temporary, repository) = fixture_repository();
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let home = temporary.path().join("home");
+    let config_path = home.join(".config/bu/config.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
+    let managed_link = home.join("dotfiles/bu/config.toml");
+    fs::create_dir_all(managed_link.parent().expect("managed link parent"))
+        .expect("managed link parent");
+    let target = home.join("generated/bu/config.toml");
+    symlink(&managed_link, &config_path).expect("default config link");
+    symlink(&target, &managed_link).expect("managed config link");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let output = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&config_path)
+            .expect("default config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::symlink_metadata(&managed_link)
+            .expect("managed config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    let config = fs::read_to_string(&target).expect("chained symlink target config");
+    let parsed: bu::Config = toml::from_str(&config).expect("chained symlink target config parses");
+    assert_eq!(parsed.benches.len(), 1);
+}
+
+#[test]
 fn default_config_is_created_and_updated_from_numbered_sibling_benches() {
     let (temporary, repository) = fixture_repository();
     let linked_main = repository
