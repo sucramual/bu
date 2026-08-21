@@ -9,12 +9,13 @@ bu status
 bu status --verbose
 bu status --color auto|always|never
 bu recycle
+bu recycle --force
 bu recycle --color auto|always|never
 ```
 
 `status` is read-only. By default it prints one concise row per bench and a summary. Use `-v` or `--verbose` for configured paths, structured dirty files, and complete failure diagnostics. Status and recycle styling color only the leading marker; `auto` (the default) uses color only on a terminal without `NO_COLOR`, while `always` and `never` override that policy.
 
-`recycle` fetches the configured upstream once, then mutates only benches that pass every safety check. Failed rows include the detailed diagnostic needed to understand the state and recover safely.
+`recycle` fetches the configured upstream once, then mutates only benches that pass every safety check. A dirty bench is `forceable` only when exactly one merged pull request has a head commit equal to local `HEAD`. Ordinary recycle leaves it unchanged. `bu recycle --force` permanently discards its staged, unstaged, and untracked changes. Failed rows include the detailed diagnostic needed to understand the state and recover safely.
 
 ## Installation and updates
 
@@ -47,9 +48,11 @@ Use `bu --config /path/to/config.toml status` to test a fixed configuration with
 
 ## Safety model
 
-`status` only runs read-only Git and GitHub queries. When the default config is used, it may create the file or append newly discovered benches before reporting each managed bench as eligible, blocked, idle, or failed. Ordinary blocked and idle benches do not make the command fail.
+`status` only runs read-only Git and GitHub queries. When the default config is used, it may create the file or append newly discovered benches before reporting each managed bench as eligible, forceable, blocked, idle, or failed. Ordinary forceable, blocked, and idle benches do not make the command fail.
 
-`recycle` first fetches `origin/main`. For each eligible bench, it rechecks cleanliness, normal Git operation state, branch attachment, one merged pull request, stand-in ownership, and fast-forwardability. It then atomically advances only the stand-in ref, switches to it without discarding changes, and verifies that the feature ref is unchanged and the worktree is clean. Any operational failure is reported per bench and produces a nonzero exit status.
+`recycle` first fetches `origin/main`. For each eligible bench, it rechecks cleanliness, normal Git operation state, branch attachment, one merged pull request, stand-in ownership, and fast-forwardability. It then atomically advances only the stand-in ref, switches to it without discarding changes, and verifies that the feature ref is unchanged and the worktree is clean.
+
+With `--force`, the same immediate recheck must classify a dirty bench as forceable. `bu` then runs `git reset --hard HEAD` followed by `git clean -fd`. This deletes tracked and untracked changes without creating a stash; ignored files and existing stashes remain. Cleanup is never attempted when the pull request is missing, unmerged, ambiguous, or points to a different commit. A cleanup failure names the failed phase and reports the paths that remain. Any operational failure is reported per bench and produces a nonzero exit status.
 
 ## Verification
 

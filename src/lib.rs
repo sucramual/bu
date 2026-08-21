@@ -245,10 +245,10 @@ pub fn run_status(config: &Config) -> RunReport {
     report::status(config, &git, &github)
 }
 
-pub fn run_recycle(config: &Config) -> RunReport {
+pub fn run_recycle(config: &Config, force: bool) -> RunReport {
     let git = GitAdapter::new();
     let github = GitHubAdapter::new();
-    report::recycle(config, &git, &github)
+    report::recycle(config, &git, &github, force)
 }
 
 fn default_config_path() -> Result<PathBuf, AppError> {

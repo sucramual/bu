@@ -33,7 +33,8 @@ fn fixture_repository() -> (TempDir, std::path::PathBuf) {
     git(&repository, &["config", "user.name", "bu test"]);
     git(&repository, &["config", "user.email", "bu@example.test"]);
     fs::write(repository.join("README.md"), "fixture\n").expect("fixture file");
-    git(&repository, &["add", "README.md"]);
+    fs::write(repository.join(".gitignore"), "ignored.log\n").expect("ignore fixture");
+    git(&repository, &["add", "README.md", ".gitignore"]);
     git(&repository, &["commit", "-m", "initial fixture"]);
     git(&repository, &["branch", "main-01"]);
     git(&repository, &["switch", "-c", "feature/merged"]);
@@ -102,6 +103,28 @@ fn fake_gh(temporary: &TempDir, body: &str) -> std::path::PathBuf {
     permissions.set_mode(0o755);
     fs::set_permissions(&executable, permissions).expect("make fake gh executable");
     bin
+}
+
+fn fake_git(bin: &Path, body: &str) {
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("find real git")
+            .stdout,
+    )
+    .expect("Git path is UTF-8");
+    let executable = bin.join("git");
+    fs::write(
+        &executable,
+        format!("#!/bin/sh\n{body}\nexec \"{}\" \"$@\"\n", real_git.trim()),
+    )
+    .expect("fake git executable");
+    let mut permissions = fs::metadata(&executable)
+        .expect("fake git metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&executable, permissions).expect("make fake git executable");
 }
 
 fn merged_pull_request_body(branch: &str, head_commit: &str) -> String {
@@ -554,10 +577,14 @@ fn status_color_policy_styles_only_the_marker_and_honors_overrides() {
 }
 
 #[test]
-fn status_skips_a_dirty_bench_without_querying_github() {
+fn status_reports_a_dirty_exact_match_as_forceable_without_changing_git_state() {
     let (temporary, repository) = fixture_repository();
     let config = write_config(&temporary, &repository);
-    let fake_bin = fake_gh(&temporary, "exit 99");
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
     fs::write(repository.join("README.md"), "dirty fixture\n").expect("dirty fixture");
     let before = git(&repository, &["status", "--porcelain=v1", "--branch"]);
     let before_refs = git(&repository, &["show-ref", "--head"]);
@@ -570,13 +597,406 @@ fn status_skips_a_dirty_bench_without_querying_github() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("▎ blocked  repository feature/merged dirty worktree (1 file)\n"));
+    assert!(stdout.contains(
+        "▎ forceable repository feature/merged merged pull request #42; dirty worktree (1 file)\n"
+    ));
+    assert!(stdout.contains("1 bench forceable with `bu recycle --force`\n"));
     assert!(!stdout.contains(" M README.md\n"));
     assert_eq!(
         git(&repository, &["status", "--porcelain=v1", "--branch"]),
         before
     );
     assert_eq!(git(&repository, &["show-ref", "--head"]), before_refs);
+}
+
+#[test]
+fn ordinary_recycle_leaves_a_forceable_bench_unchanged_and_explains_force() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    fs::write(repository.join("README.md"), "dirty fixture\n").expect("dirty fixture");
+    let before = git(&repository, &["status", "--porcelain=v1", "--branch"]);
+    let feature_before = git(&repository, &["rev-parse", "feature/merged"]);
+    let standin_before = git(&repository, &["rev-parse", "main-01"]);
+
+    let output = recycle(&config, &fake_bin);
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("▎ forceable repository feature/merged"));
+    assert!(stdout.contains("run `bu recycle --force` to discard 1 dirty file"));
+    assert_eq!(
+        git(&repository, &["status", "--porcelain=v1", "--branch"]),
+        before
+    );
+    assert_eq!(
+        git(&repository, &["rev-parse", "feature/merged"]),
+        feature_before
+    );
+    assert_eq!(git(&repository, &["rev-parse", "main-01"]), standin_before);
+}
+
+#[test]
+fn force_recycle_discards_tracked_and_untracked_changes_but_preserves_ignored_and_stash() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    let feature_before = git(&repository, &["rev-parse", "feature/merged"]);
+    fs::write(repository.join("STASHED.md"), "stash fixture\n").expect("stash fixture");
+    git(
+        &repository,
+        &["stash", "push", "--include-untracked", "-m", "keep me"],
+    );
+    let stash_before = git(&repository, &["stash", "list"]);
+    fs::write(repository.join("README.md"), "unstaged change\n").expect("unstaged change");
+    fs::write(repository.join("STAGED.md"), "staged change\n").expect("staged change");
+    git(&repository, &["add", "STAGED.md"]);
+    fs::write(repository.join("UNTRACKED.md"), "untracked change\n").expect("untracked change");
+    fs::write(repository.join("ignored.log"), "preserve me\n").expect("ignored change");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("▎ recycled repository main-01 feature/merged preserved"));
+    assert!(stdout.contains("    discarded: README.md\n"));
+    assert!(stdout.contains("    discarded: STAGED.md\n"));
+    assert!(stdout.contains("    discarded: UNTRACKED.md\n"));
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "main-01"
+    );
+    assert_eq!(
+        git(&repository, &["rev-parse", "feature/merged"]),
+        feature_before
+    );
+    assert_eq!(git(&repository, &["stash", "list"]), stash_before);
+    assert_eq!(
+        fs::read_to_string(repository.join("ignored.log")).expect("ignored file remains"),
+        "preserve me\n"
+    );
+    assert!(!repository.join("STAGED.md").exists());
+    assert!(!repository.join("UNTRACKED.md").exists());
+    assert!(git(&repository, &["status", "--porcelain=v1"]).is_empty());
+}
+
+#[test]
+fn force_recycle_blocks_a_dirty_branch_without_an_exact_merged_head_match() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "origin/main"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    fs::write(repository.join("README.md"), "must remain\n").expect("dirty fixture");
+    let before = git(&repository, &["status", "--porcelain=v1", "--branch"]);
+    let feature_before = git(&repository, &["rev-parse", "feature/merged"]);
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(
+        "▎ blocked  repository feature/merged current branch does not have exactly one merged pull request"
+    ));
+    assert_eq!(
+        git(&repository, &["status", "--porcelain=v1", "--branch"]),
+        before
+    );
+    assert_eq!(
+        git(&repository, &["rev-parse", "feature/merged"]),
+        feature_before
+    );
+}
+
+#[test]
+fn force_recycle_reports_the_cleanup_phase_and_remaining_paths() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    fake_git(
+        &fake_bin,
+        r#"if [ "$1" = "reset" ]; then
+  echo "injected reset failure" >&2
+  exit 41
+fi"#,
+    );
+    fs::write(repository.join("README.md"), "must remain\n").expect("tracked fixture");
+    fs::write(repository.join("UNTRACKED.md"), "must remain\n").expect("untracked fixture");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(
+        "▎ failed   repository feature/merged cleanup failed; worktree may be partially cleaned"
+    ));
+    assert!(stdout.contains("    failed phase: tracked reset\n"));
+    assert!(stdout.contains("injected reset failure"));
+    assert!(stdout.contains("    remaining: README.md\n"));
+    assert!(stdout.contains("    remaining: UNTRACKED.md\n"));
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+    assert!(repository.join("UNTRACKED.md").exists());
+}
+
+#[test]
+fn force_recycle_reports_partial_cleanup_when_untracked_removal_fails() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    fake_git(
+        &fake_bin,
+        r#"if [ "$1" = "clean" ]; then
+  echo "injected clean failure" >&2
+  exit 42
+fi"#,
+    );
+    fs::write(repository.join("README.md"), "reset me\n").expect("tracked fixture");
+    fs::write(repository.join("UNTRACKED.md"), "must remain\n").expect("untracked fixture");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("    failed phase: untracked cleanup\n"));
+    assert!(stdout.contains("    remaining: UNTRACKED.md\n"));
+    assert!(!stdout.contains("    remaining: README.md\n"));
+    assert_eq!(
+        fs::read_to_string(repository.join("README.md")).expect("tracked file reset"),
+        "fixture\n"
+    );
+    assert!(repository.join("UNTRACKED.md").exists());
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+}
+
+#[test]
+fn force_recycle_rechecks_the_pull_request_before_deleting_files() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let head = git(&repository, &["rev-parse", "HEAD"]);
+    let mismatched_head = git(&repository, &["rev-parse", "origin/main"]);
+    let counter = temporary.path().join("gh-count");
+    let fake_bin = fake_gh(
+        &temporary,
+        &format!(
+            r#"count_file='{}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+if [ "$count" -eq 0 ]; then
+  oid='{}'
+else
+  oid='{}'
+fi
+printf '%s' "$((count + 1))" > "$count_file"
+printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"feature/merged","headRefOid":"%s"}}]\n' "$oid""#,
+            counter.display(),
+            head.trim(),
+            mismatched_head.trim(),
+        ),
+    );
+    fs::write(repository.join("README.md"), "must remain\n").expect("dirty fixture");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(
+        "▎ blocked  repository feature/merged current branch does not have exactly one merged pull request"
+    ));
+    assert_eq!(
+        fs::read_to_string(repository.join("README.md")).expect("dirty file remains"),
+        "must remain\n"
+    );
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+}
+
+#[test]
+fn force_recycle_aborts_when_head_moves_after_the_pull_request_recheck() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let verified_head = git(&repository, &["rev-parse", "HEAD"]);
+    let moved_head = git(&repository, &["rev-parse", "origin/main"]);
+    let counter = temporary.path().join("gh-count");
+    let fake_bin = fake_gh(
+        &temporary,
+        &format!(
+            r#"count_file='{}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+if [ "$count" -eq 1 ]; then
+  git update-ref refs/heads/feature/merged '{}'
+fi
+printf '%s' "$((count + 1))" > "$count_file"
+printf '%s\n' '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"feature/merged","headRefOid":"{}"}}]'"#,
+            counter.display(),
+            moved_head.trim(),
+            verified_head.trim(),
+        ),
+    );
+    fs::write(repository.join("KEEP.md"), "must remain\n").expect("dirty fixture");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains(
+        "▎ blocked  repository feature/merged current branch does not have exactly one merged pull request"
+    ));
+    assert_eq!(
+        fs::read_to_string(repository.join("KEEP.md")).expect("dirty file remains"),
+        "must remain\n"
+    );
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+}
+
+#[test]
+fn force_recycle_aborts_when_a_git_operation_starts_after_the_recheck() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let verified_head = git(&repository, &["rev-parse", "HEAD"]);
+    let counter = temporary.path().join("gh-count");
+    let fake_bin = fake_gh(
+        &temporary,
+        &format!(
+            r#"count_file='{}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+if [ "$count" -eq 1 ]; then
+  printf '%s\n' '{}' > "$(git rev-parse --git-path MERGE_HEAD)"
+fi
+printf '%s' "$((count + 1))" > "$count_file"
+printf '%s\n' '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"feature/merged","headRefOid":"{}"}}]'"#,
+            counter.display(),
+            verified_head.trim(),
+            verified_head.trim(),
+        ),
+    );
+    fs::write(repository.join("KEEP.md"), "must remain\n").expect("dirty fixture");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("▎ blocked  repository feature/merged Git operation in progress: merge")
+    );
+    assert_eq!(
+        fs::read_to_string(repository.join("KEEP.md")).expect("dirty file remains"),
+        "must remain\n"
+    );
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+}
+
+#[test]
+fn force_recycle_aborts_when_the_standin_changes_after_the_recheck() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    let verified_head = git(&repository, &["rev-parse", "HEAD"]);
+    let counter = temporary.path().join("gh-count");
+    let fake_bin = fake_gh(
+        &temporary,
+        &format!(
+            r#"count_file='{}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+if [ "$count" -eq 1 ]; then
+  git update-ref -d refs/heads/main-01
+fi
+printf '%s' "$((count + 1))" > "$count_file"
+printf '%s\n' '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"feature/merged","headRefOid":"{}"}}]'"#,
+            counter.display(),
+            verified_head.trim(),
+        ),
+    );
+    fs::write(repository.join("KEEP.md"), "must remain\n").expect("dirty fixture");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("▎ blocked  repository feature/merged stand-in branch is missing")
+    );
+    assert_eq!(
+        fs::read_to_string(repository.join("KEEP.md")).expect("dirty file remains"),
+        "must remain\n"
+    );
+    assert!(
+        git(&repository, &["branch", "--list", "main-01"])
+            .trim()
+            .is_empty()
+    );
+}
+
+#[test]
+fn one_force_command_recycles_every_forceable_bench() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let second_bench = add_numbered_bench(&repository, "02", "feature/two");
+    let config = temporary.path().join("two-benches.toml");
+    fs::write(
+        &config,
+        format!(
+            "[repository]\npath = \"{}\"\nremote = \"origin\"\nmain_branch = \"main\"\n\n[[benches]]\npath = \"{}\"\nstandin_branch = \"main-01\"\n\n[[benches]]\npath = \"{}\"\nstandin_branch = \"main-02\"\n",
+            repository.display(),
+            repository.display(),
+            second_bench.display(),
+        ),
+    )
+    .expect("config file");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+    fs::write(repository.join("ONE.md"), "discard one\n").expect("first dirty file");
+    fs::write(second_bench.join("TWO.md"), "discard two\n").expect("second dirty file");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("    discarded: ONE.md\n"));
+    assert!(stdout.contains("    discarded: TWO.md\n"));
+    assert!(stdout.contains("2 recycled, 0 blocked, 0 skipped, 0 failed\n"));
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "main-01"
+    );
+    assert_eq!(
+        git(&second_bench, &["branch", "--show-current"]).trim(),
+        "main-02"
+    );
+    assert!(!repository.join("ONE.md").exists());
+    assert!(!second_bench.join("TWO.md").exists());
 }
 
 #[test]
@@ -807,7 +1227,6 @@ fn status_skips_a_local_tip_that_does_not_match_the_merged_pull_request() {
 fn status_reports_every_structured_dirty_file() {
     let (temporary, repository) = fixture_repository();
     let config = write_config(&temporary, &repository);
-    let fake_bin = fake_gh(&temporary, "exit 99");
     fs::write(repository.join("SOURCE.md"), "source\n").expect("rename source");
     git(&repository, &["add", "SOURCE.md"]);
     git(&repository, &["commit", "-m", "add rename source"]);
@@ -816,6 +1235,11 @@ fn status_reports_every_structured_dirty_file() {
     fs::write(repository.join("README.md"), "unstaged\n").expect("unstaged file");
     fs::write(repository.join("UNTRACKED.md"), "untracked\n").expect("untracked file");
     git(&repository, &["mv", "SOURCE.md", "RENAMED.md"]);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
 
     let output = status_with(&config, &fake_bin, &["--verbose"], &[]);
 
@@ -832,7 +1256,6 @@ fn status_reports_every_structured_dirty_file() {
 fn status_escapes_control_characters_in_dirty_file_paths() {
     let (temporary, repository) = fixture_repository();
     let config = write_config(&temporary, &repository);
-    let fake_bin = fake_gh(&temporary, "exit 99");
     let source = "source\nname\u{1b}[31m";
     fs::write(repository.join(source), "source\n").expect("rename source");
     git(&repository, &["add", source]);
@@ -842,6 +1265,11 @@ fn status_escapes_control_characters_in_dirty_file_paths() {
     );
     git(&repository, &["mv", source, "RENAMED.md"]);
     fs::write(repository.join("line\nname\u{1b}[31m"), "dirty\n").expect("dirty file");
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
 
     let output = status_with(&config, &fake_bin, &["-v"], &[]);
 

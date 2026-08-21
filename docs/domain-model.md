@@ -21,6 +21,10 @@ _Code_: NEW ENTITY `BenchConfig.standin_branch`
 **Eligible bench:** A bench whose worktree is clean, Git operation state is normal, current branch maps unambiguously to one merged pull request, and stand-in branch can fast-forward to fetched `origin/main`.
 _Code_: NEW ENTITY `EligibleBench`
 
+**Forceable bench:** A dirty bench that passes every non-cleanliness safety check and has exactly one merged pull request whose head commit equals local `HEAD`. Status is read-only; only `bu recycle --force` may discard its staged, unstaged, and untracked changes.
+_Avoid_: eligible bench, generally safe dirty bench
+_Code_: `BenchDecision::Forceable`
+
 **Recycled bench:** A bench checked out on its stand-in branch at fetched `origin/main` while its former feature branch ref remains unchanged.
 _Code_: NEW ENTITY `RecycleOutcome`
 

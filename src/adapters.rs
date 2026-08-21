@@ -262,6 +262,36 @@ impl GitAdapter {
         Ok(output.stdout.trim().to_owned())
     }
 
+    pub fn optional_ref_commit(
+        &self,
+        repository: &Path,
+        reference: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.ref_exists(repository, reference)? {
+            self.ref_commit(repository, reference).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn reset_hard(&self, bench: &Path) -> Result<(), AdapterError> {
+        let output = run_command(bench, "git", &arguments(&["reset", "--hard", "HEAD"]))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git reset", bench, output))
+        }
+    }
+
+    pub fn clean_untracked(&self, bench: &Path) -> Result<(), AdapterError> {
+        let output = run_command(bench, "git", &arguments(&["clean", "-fd"]))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git clean", bench, output))
+        }
+    }
+
     pub fn fetch_main(
         &self,
         repository: &Path,
