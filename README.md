@@ -1,6 +1,6 @@
 # bu
 
-`bu` reports and safely recycles explicitly configured Git worktree benches.
+`bu` reports and safely recycles durable Git worktree benches.
 
 ## Commands
 
@@ -28,7 +28,9 @@ Cargo copies the executable into its binary directory, normally `~/.cargo/bin`; 
 
 ## Configuration
 
-Copy [`config.example.toml`](config.example.toml) to `~/.config/bu/config.toml` and list only the durable benches that `bu` may manage. Each bench maps to its own long-lived `main-NN` stand-in branch.
+Run `bu status` from the repository or any of its worktrees. On the first run, `bu` creates `~/.config/bu/config.toml` with `origin` as the remote and `main` as the main branch.
+
+Each default-config run discovers registered sibling worktrees named `<repository>-NN`, maps them to `main-NN`, and appends new ones to the config. The strict sibling name excludes temporary worktrees under `.codex`, `.claude`, `.cheese-worktrees`, and `/tmp`. Existing explicit entries remain managed.
 
 ```toml
 [repository]
@@ -41,11 +43,11 @@ path = "/Users/you/Documents/example-repo-01"
 standin_branch = "main-01"
 ```
 
-Use `bu --config /path/to/config.toml status` to test a configuration without installing it.
+Use `bu --config /path/to/config.toml status` to test a fixed configuration without installing it. Explicit config paths are never created or updated automatically.
 
 ## Safety model
 
-`status` only runs read-only Git and GitHub queries. It reports each configured bench as eligible, blocked, idle, or failed; ordinary blocked and idle benches do not make the command fail.
+`status` only runs read-only Git and GitHub queries. When the default config is used, it may create the file or append newly discovered benches before reporting each managed bench as eligible, blocked, idle, or failed. Ordinary blocked and idle benches do not make the command fail.
 
 `recycle` first fetches `origin/main`. For each eligible bench, it rechecks cleanliness, normal Git operation state, branch attachment, one merged pull request, stand-in ownership, and fast-forwardability. It then atomically advances only the stand-in ref, switches to it without discarding changes, and verifies that the feature ref is unchanged and the worktree is clean. Any operational failure is reported per bench and produces a nonzero exit status.
 

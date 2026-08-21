@@ -64,6 +64,12 @@ fn unexpected_exit(program: &str, cwd: &Path, output: CommandOutput) -> AdapterE
 
 pub struct GitAdapter;
 
+#[derive(Debug)]
+pub struct GitWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+}
+
 impl GitAdapter {
     pub fn new() -> Self {
         Self
@@ -84,6 +90,19 @@ impl GitAdapter {
 
     pub fn same_repository(&self, repository: &Path, bench: &Path) -> Result<bool, AdapterError> {
         Ok(self.git_common_dir(repository)? == self.git_common_dir(bench)?)
+    }
+
+    pub fn worktrees(&self, repository: &Path) -> Result<Vec<GitWorktree>, AdapterError> {
+        let output = run_command(
+            repository,
+            "git",
+            &arguments(&["worktree", "list", "--porcelain", "-z"]),
+        )?;
+        if !output.success {
+            return Err(unexpected_exit("git worktree list", repository, output));
+        }
+
+        parse_worktrees(&output.raw_stdout, repository)
     }
 
     pub fn current_branch(&self, bench: &Path) -> Result<CurrentBranch, AdapterError> {
@@ -298,28 +317,84 @@ impl GitAdapter {
         bench: &Path,
         standin_ref: &str,
     ) -> Result<Option<PathBuf>, AdapterError> {
-        let output = run_command(
-            repository,
-            "git",
-            &arguments(&["worktree", "list", "--porcelain"]),
-        )?;
-        if !output.success {
-            return Err(unexpected_exit("git worktree list", repository, output));
+        let standin_branch = standin_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(standin_ref);
+        Ok(self
+            .worktrees(repository)?
+            .into_iter()
+            .find(|worktree| {
+                worktree.branch.as_deref() == Some(standin_branch) && worktree.path != bench
+            })
+            .map(|worktree| worktree.path))
+    }
+}
+
+fn parse_worktrees(output: &[u8], repository: &Path) -> Result<Vec<GitWorktree>, AdapterError> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !output.ends_with(b"\0\0") {
+        return Err(AdapterError::InvalidWorktreeList {
+            cwd: repository.to_path_buf(),
+            message: "output is not terminated by an empty NUL-delimited record".to_owned(),
+        });
+    }
+
+    let mut worktrees = Vec::new();
+    let mut path = None;
+    let mut branch = None;
+    let mut saw_field = false;
+    for field in output.split(|byte| *byte == b'\0') {
+        if field.is_empty() {
+            if let Some(path) = path.take() {
+                worktrees.push(GitWorktree {
+                    path,
+                    branch: branch.take(),
+                });
+                saw_field = false;
+            } else if saw_field {
+                return Err(AdapterError::InvalidWorktreeList {
+                    cwd: repository.to_path_buf(),
+                    message: "record is missing its worktree path".to_owned(),
+                });
+            }
+            continue;
         }
 
-        let mut worktree = None;
-        for line in output.stdout.lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                worktree = Some(PathBuf::from(path));
-            } else if let Some(branch) = line.strip_prefix("branch ")
-                && branch == standin_ref
-                && worktree.as_deref() != Some(bench)
-            {
-                return Ok(worktree);
+        saw_field = true;
+        if let Some(value) = field.strip_prefix(b"worktree ") {
+            if path.is_some() {
+                return Err(AdapterError::InvalidWorktreeList {
+                    cwd: repository.to_path_buf(),
+                    message: "record contains more than one worktree path".to_owned(),
+                });
             }
+            if value.is_empty() {
+                return Err(AdapterError::InvalidWorktreeList {
+                    cwd: repository.to_path_buf(),
+                    message: "record has an empty worktree path".to_owned(),
+                });
+            }
+            path = Some(path_from_bytes(value));
+        } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
+            branch = Some(String::from_utf8_lossy(value).into_owned());
         }
-        Ok(None)
     }
+    Ok(worktrees)
+}
+
+#[cfg(unix)]
+fn path_from_bytes(value: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    PathBuf::from(OsString::from_vec(value.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(value: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(value).into_owned())
 }
 
 fn parse_worktree_state(output: &[u8], bench: &Path) -> Result<WorktreeState, AdapterError> {
@@ -405,9 +480,22 @@ fn is_status_code(status: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_worktree_state;
+    use super::{parse_worktree_state, parse_worktrees};
     use crate::domain::WorktreeState;
     use std::path::Path;
+
+    #[test]
+    fn parses_nul_delimited_worktree_paths_with_newlines() {
+        let worktrees = parse_worktrees(
+            b"worktree /repository-01\nscratch\0HEAD abc123\0branch refs/heads/feature/newline\0\0",
+            Path::new("/repository"),
+        )
+        .expect("valid NUL-delimited worktree list");
+
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].path, Path::new("/repository-01\nscratch"));
+        assert_eq!(worktrees[0].branch.as_deref(), Some("feature/newline"));
+    }
 
     #[test]
     fn parses_nul_delimited_dirty_files_and_rename_sources() {

@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -110,8 +110,71 @@ fn merged_pull_request_body(branch: &str, head_commit: &str) -> String {
     )
 }
 
+fn matching_merged_pull_request_body() -> &'static str {
+    r#"head=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--head" ]; then
+    shift
+    head="$1"
+  fi
+  shift
+done
+oid=$(git rev-parse "$head")
+printf '[{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"%s"}]\n' "$head" "$oid""#
+}
+
+fn add_numbered_bench(repository: &Path, slot: &str, feature_branch: &str) -> std::path::PathBuf {
+    let repository_name = repository
+        .file_name()
+        .expect("repository name")
+        .to_string_lossy();
+    let bench = repository
+        .parent()
+        .expect("repository parent")
+        .join(format!("{repository_name}-{slot}"));
+    let standin_branch = format!("main-{slot}");
+    if git(repository, &["branch", "--list", &standin_branch])
+        .trim()
+        .is_empty()
+    {
+        git(repository, &["branch", &standin_branch]);
+    }
+    git(
+        repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            feature_branch,
+            bench.to_str().expect("bench path is UTF-8"),
+            "main",
+        ],
+    );
+    bench
+}
+
 fn status(config: &Path, fake_bin: &Path) -> Output {
     status_with(config, fake_bin, &[], &[])
+}
+
+fn bu_command(fake_bin: &Path) -> Command {
+    let original_path = env::var_os("PATH").expect("PATH is set");
+    let path = env::join_paths(
+        std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&original_path)),
+    )
+    .expect("valid PATH");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bu"));
+    command.env("PATH", path);
+    command
+}
+
+fn status_command(config: Option<&Path>, fake_bin: &Path) -> Command {
+    let mut command = bu_command(fake_bin);
+    if let Some(config) = config {
+        command.args(["--config"]).arg(config);
+    }
+    command.arg("status");
+    command
 }
 
 fn status_with(
@@ -120,18 +183,17 @@ fn status_with(
     arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Output {
-    let original_path = env::var_os("PATH").expect("PATH is set");
-    let path = env::join_paths(
-        std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&original_path)),
-    )
-    .expect("valid PATH");
-    Command::new(env!("CARGO_BIN_EXE_bu"))
-        .args(["--config"])
-        .arg(config)
-        .arg("status")
+    status_command(Some(config), fake_bin)
         .args(arguments)
-        .env("PATH", path)
         .envs(environment.iter().copied())
+        .output()
+        .expect("bu should start")
+}
+
+fn status_with_default_config(repository: &Path, home: &Path, fake_bin: &Path) -> Output {
+    status_command(None, fake_bin)
+        .current_dir(repository)
+        .env("HOME", home)
         .output()
         .expect("bu should start")
 }
@@ -146,20 +208,279 @@ fn recycle_with(
     arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Output {
-    let original_path = env::var_os("PATH").expect("PATH is set");
-    let path = env::join_paths(
-        std::iter::once(fake_bin.to_path_buf()).chain(env::split_paths(&original_path)),
-    )
-    .expect("valid PATH");
-    Command::new(env!("CARGO_BIN_EXE_bu"))
+    bu_command(fake_bin)
         .args(["--config"])
         .arg(config)
         .arg("recycle")
         .args(arguments)
-        .env("PATH", path)
         .envs(environment.iter().copied())
         .output()
         .expect("bu should start")
+}
+
+#[test]
+fn default_config_uses_primary_checkout_when_main_is_not_checked_out() {
+    let (temporary, repository) = fixture_repository();
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).expect("home directory");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let output = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = fs::read_to_string(home.join(".config/bu/config.toml")).expect("generated config");
+    let parsed: bu::Config = toml::from_str(&config).expect("generated config parses");
+    assert_eq!(
+        parsed.repository.path,
+        fs::canonicalize(&repository).expect("fixture repository path exists")
+    );
+    assert_eq!(parsed.repository.remote, "origin");
+    assert_eq!(parsed.repository.main_branch, "main");
+    assert_eq!(parsed.benches.len(), 1);
+    assert_eq!(
+        parsed.benches[0].path,
+        fs::canonicalize(&bench).expect("fixture bench path exists")
+    );
+    assert_eq!(parsed.benches[0].standin_branch, "main-01");
+}
+
+#[test]
+fn default_config_adds_a_bench_after_an_empty_first_run() {
+    let (temporary, repository) = fixture_repository();
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).expect("home directory");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let first = status_with_default_config(&repository, &home, &fake_bin);
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let config_path = home.join(".config/bu/config.toml");
+    let first_config = fs::read_to_string(&config_path).expect("generated config");
+    assert!(!first_config.contains("benches = []"));
+    let first_parsed: bu::Config = toml::from_str(&first_config).expect("generated config parses");
+    assert!(first_parsed.benches.is_empty());
+
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let second = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let updated_config = fs::read_to_string(&config_path).expect("updated config");
+    let updated: bu::Config = toml::from_str(&updated_config).expect("updated config parses");
+    assert_eq!(updated.benches.len(), 1);
+
+    let third = status_with_default_config(&bench, &home, &fake_bin);
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+}
+
+#[test]
+fn default_config_creates_the_target_of_a_dangling_symlink() {
+    let (temporary, repository) = fixture_repository();
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let home = temporary.path().join("home");
+    let config_path = home.join(".config/bu/config.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
+    let target = home.join("dotfiles/bu/config.toml");
+    symlink(&target, &config_path).expect("dangling default config link");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let output = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&config_path)
+            .expect("default config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    let config = fs::read_to_string(&target).expect("symlink target config");
+    let parsed: bu::Config = toml::from_str(&config).expect("symlink target config parses");
+    assert_eq!(parsed.benches.len(), 1);
+}
+
+#[test]
+fn default_config_preserves_chained_symlinks_to_a_dangling_target() {
+    let (temporary, repository) = fixture_repository();
+    let bench = add_numbered_bench(&repository, "01", "feature/one");
+    let home = temporary.path().join("home");
+    let config_path = home.join(".config/bu/config.toml");
+    fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
+    let managed_link = home.join("dotfiles/bu/config.toml");
+    fs::create_dir_all(managed_link.parent().expect("managed link parent"))
+        .expect("managed link parent");
+    let target = home.join("generated/bu/config.toml");
+    symlink(&managed_link, &config_path).expect("default config link");
+    symlink(&target, &managed_link).expect("managed config link");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let output = status_with_default_config(&bench, &home, &fake_bin);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&config_path)
+            .expect("default config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        fs::symlink_metadata(&managed_link)
+            .expect("managed config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    let config = fs::read_to_string(&target).expect("chained symlink target config");
+    let parsed: bu::Config = toml::from_str(&config).expect("chained symlink target config parses");
+    assert_eq!(parsed.benches.len(), 1);
+}
+
+#[test]
+fn default_config_is_created_and_updated_from_numbered_sibling_benches() {
+    let (temporary, repository) = fixture_repository();
+    let linked_main = repository
+        .parent()
+        .expect("repository parent")
+        .join("linked-main-worktree");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            linked_main.to_str().expect("linked main path is UTF-8"),
+            "main",
+        ],
+    );
+    let first_bench = add_numbered_bench(&repository, "01", "feature/one");
+    let wrong_width_bench =
+        add_numbered_bench(&repository, "20260810", "feature/date-stamped-scratch");
+    let repository_name = repository
+        .file_name()
+        .expect("repository name")
+        .to_string_lossy();
+    let newline_scratch = repository
+        .parent()
+        .expect("repository parent")
+        .join(format!("{repository_name}-03\nscratch"));
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/newline-scratch",
+            newline_scratch
+                .to_str()
+                .expect("newline scratch path is UTF-8"),
+            "main",
+        ],
+    );
+    let home = temporary.path().join("home");
+    fs::create_dir(&home).expect("home directory");
+    let fake_bin = fake_gh(&temporary, matching_merged_pull_request_body());
+
+    let first = status_with_default_config(&first_bench, &home, &fake_bin);
+
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("Checked 1 bench"));
+    let config_path = home.join(".config/bu/config.toml");
+    let first_config = fs::read_to_string(&config_path).expect("generated config");
+    let parsed: bu::Config = toml::from_str(&first_config).expect("generated config parses");
+    assert_eq!(
+        parsed.repository.path,
+        fs::canonicalize(&repository).expect("fixture repository path exists")
+    );
+    assert_eq!(parsed.repository.remote, "origin");
+    assert_eq!(parsed.repository.main_branch, "main");
+    assert_eq!(parsed.benches.len(), 1);
+    assert_eq!(
+        parsed.benches[0].path,
+        fs::canonicalize(&first_bench).expect("fixture bench path exists")
+    );
+    assert_eq!(parsed.benches[0].standin_branch, "main-01");
+    assert!(
+        parsed
+            .benches
+            .iter()
+            .all(|bench| bench.path != wrong_width_bench)
+    );
+    assert!(parsed.benches.iter().all(|bench| {
+        !bench
+            .path
+            .to_string_lossy()
+            .contains(&format!("{repository_name}-03"))
+    }));
+
+    let second_bench = add_numbered_bench(&repository, "02", "feature/two");
+    let dotfiles_config = home.join("dotfiles-config.toml");
+    fs::rename(&config_path, &dotfiles_config).expect("move generated config into dotfiles");
+    symlink(&dotfiles_config, &config_path).expect("link default config to dotfiles");
+    fs::write(
+        &config_path,
+        format!("# Preserve this comment.\nunknown_top_level = \"keep\"\n\n{first_config}"),
+    )
+    .expect("add user-authored config content");
+    let scratch = repository
+        .parent()
+        .expect("repository parent")
+        .join("scratch-worktree");
+    git(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/scratch",
+            scratch.to_str().expect("scratch path is UTF-8"),
+            "main",
+        ],
+    );
+
+    let second = status_with_default_config(&repository, &home, &fake_bin);
+
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(String::from_utf8_lossy(&second.stdout).contains("Checked 2 benches"));
+    let updated_config = fs::read_to_string(&config_path).expect("updated config");
+    assert!(
+        fs::symlink_metadata(&config_path)
+            .expect("default config metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(updated_config.starts_with("# Preserve this comment.\nunknown_top_level = \"keep\"\n"));
+    assert!(updated_config.contains(&first_bench.display().to_string()));
+    assert!(updated_config.contains(&second_bench.display().to_string()));
+    assert!(!updated_config.contains(&scratch.display().to_string()));
 }
 
 #[test]

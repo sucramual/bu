@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum AppError {
     #[error("could not determine the home directory for the default config path")]
     HomeDirectoryUnavailable,
+    #[error("could not determine the current directory while creating the default config: {0}")]
+    CurrentDirectory(#[source] io::Error),
     #[error("could not read configuration at {path}: {source}")]
     ConfigRead { path: PathBuf, source: io::Error },
     #[error("could not parse configuration at {path}: {source}")]
@@ -14,6 +16,15 @@ pub enum AppError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("could not discover benches from repository at {path}: {message}")]
+    ConfigDiscovery { path: PathBuf, message: String },
+    #[error("could not serialize configuration at {path}: {source}")]
+    ConfigSerialize {
+        path: PathBuf,
+        source: toml::ser::Error,
+    },
+    #[error("could not write configuration at {path}: {source}")]
+    ConfigWrite { path: PathBuf, source: io::Error },
 }
 
 #[derive(Debug, Error)]
@@ -42,4 +53,6 @@ pub enum AdapterError {
     },
     #[error("could not parse git status output in {cwd}: {message}")]
     InvalidStatus { cwd: PathBuf, message: String },
+    #[error("could not parse git worktree output in {cwd}: {message}")]
+    InvalidWorktreeList { cwd: PathBuf, message: String },
 }
