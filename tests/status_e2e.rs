@@ -693,6 +693,47 @@ fn force_recycle_discards_tracked_and_untracked_changes_but_preserves_ignored_an
 }
 
 #[test]
+fn force_recycle_does_not_overwrite_an_ignored_file_tracked_by_upstream() {
+    let (temporary, repository) = recycle_fixture_repository();
+    let config = write_config(&temporary, &repository);
+    git(&repository, &["switch", "main"]);
+    fs::write(repository.join("ignored.log"), "upstream contents\n")
+        .expect("upstream ignored fixture");
+    git(&repository, &["add", "--force", "ignored.log"]);
+    git(
+        &repository,
+        &["commit", "-m", "track formerly ignored path"],
+    );
+    git(&repository, &["push", "origin", "main"]);
+    git(&repository, &["switch", "feature/merged"]);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    let feature_before = git(&repository, &["rev-parse", "feature/merged"]);
+    fs::write(repository.join("README.md"), "discard me\n").expect("tracked change");
+    fs::write(repository.join("ignored.log"), "preserve me\n").expect("ignored local file");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("worktree switch failed"));
+    assert_eq!(
+        fs::read_to_string(repository.join("ignored.log")).expect("ignored file remains"),
+        "preserve me\n"
+    );
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+    assert_eq!(
+        git(&repository, &["rev-parse", "feature/merged"]),
+        feature_before
+    );
+}
+
+#[test]
 fn force_recycle_blocks_a_dirty_branch_without_an_exact_merged_head_match() {
     let (temporary, repository) = recycle_fixture_repository();
     let config = write_config(&temporary, &repository);

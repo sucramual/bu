@@ -333,7 +333,11 @@ impl GitAdapter {
     }
 
     pub fn switch_branch(&self, bench: &Path, branch: &str) -> Result<(), AdapterError> {
-        let output = run_command(bench, "git", &arguments(&["switch", branch]))?;
+        let output = run_command(
+            bench,
+            "git",
+            &arguments(&["switch", "--no-overwrite-ignore", branch]),
+        )?;
         if output.success {
             Ok(())
         } else {
