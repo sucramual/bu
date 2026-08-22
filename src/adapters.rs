@@ -275,12 +275,62 @@ impl GitAdapter {
     }
 
     pub fn reset_hard(&self, bench: &Path) -> Result<(), AdapterError> {
+        self.reject_ignored_reset_obstructions(bench)?;
         let output = run_command(bench, "git", &arguments(&["reset", "--hard", "HEAD"]))?;
         if output.success {
             Ok(())
         } else {
             Err(unexpected_exit("git reset", bench, output))
         }
+    }
+
+    fn reject_ignored_reset_obstructions(&self, bench: &Path) -> Result<(), AdapterError> {
+        let ignored = run_command(
+            bench,
+            "git",
+            &arguments(&[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ]),
+        )?;
+        if !ignored.success {
+            return Err(unexpected_exit("git ls-files", bench, ignored));
+        }
+        let tracked = run_command(
+            bench,
+            "git",
+            &arguments(&["ls-tree", "-r", "--name-only", "-z", "HEAD"]),
+        )?;
+        if !tracked.success {
+            return Err(unexpected_exit("git ls-tree", bench, tracked));
+        }
+        let tracked_paths = tracked
+            .raw_stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(path_from_bytes)
+            .collect::<std::collections::HashSet<_>>();
+
+        for ignored_path in ignored
+            .raw_stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(path_from_bytes)
+        {
+            for ancestor in ignored_path.ancestors().skip(1) {
+                if tracked_paths.contains(ancestor) {
+                    return Err(AdapterError::IgnoredResetObstruction {
+                        cwd: bench.to_path_buf(),
+                        ignored_path: ignored_path.clone(),
+                        tracked_path: ancestor.to_path_buf(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn clean_untracked(&self, bench: &Path) -> Result<(), AdapterError> {

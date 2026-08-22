@@ -55,4 +55,12 @@ pub enum AdapterError {
     InvalidStatus { cwd: PathBuf, message: String },
     #[error("could not parse git worktree output in {cwd}: {message}")]
     InvalidWorktreeList { cwd: PathBuf, message: String },
+    #[error(
+        "hard reset would delete ignored path {ignored_path} obstructing tracked path {tracked_path} in {cwd}"
+    )]
+    IgnoredResetObstruction {
+        cwd: PathBuf,
+        ignored_path: PathBuf,
+        tracked_path: PathBuf,
+    },
 }
