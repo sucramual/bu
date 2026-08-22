@@ -320,14 +320,23 @@ impl GitAdapter {
             .filter(|path| !path.is_empty())
             .map(path_from_bytes)
         {
-            for ancestor in ignored_path.ancestors().skip(1) {
-                if tracked_paths.contains(ancestor) {
-                    return Err(AdapterError::IgnoredResetObstruction {
-                        cwd: bench.to_path_buf(),
-                        ignored_path: ignored_path.clone(),
-                        tracked_path: ancestor.to_path_buf(),
-                    });
-                }
+            let tracked_obstruction = ignored_path
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| tracked_paths.contains(*ancestor))
+                .map(Path::to_path_buf)
+                .or_else(|| {
+                    tracked_paths
+                        .iter()
+                        .find(|tracked_path| tracked_path.starts_with(&ignored_path))
+                        .cloned()
+                });
+            if let Some(tracked_path) = tracked_obstruction {
+                return Err(AdapterError::IgnoredResetObstruction {
+                    cwd: bench.to_path_buf(),
+                    ignored_path,
+                    tracked_path,
+                });
             }
         }
         Ok(())

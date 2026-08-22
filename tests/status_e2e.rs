@@ -771,6 +771,42 @@ fn force_recycle_preserves_ignored_files_obstructing_a_tracked_path() {
 }
 
 #[test]
+fn force_recycle_preserves_an_ignored_file_obstructing_a_tracked_directory() {
+    let (temporary, repository) = recycle_fixture_repository();
+    fs::create_dir(repository.join("node")).expect("tracked directory");
+    fs::write(repository.join("node/file"), "tracked fixture\n").expect("tracked file");
+    fs::write(repository.join(".gitignore"), "ignored.log\nnode\n").expect("ignore fixture");
+    git(&repository, &["add", "--force", "node/file", ".gitignore"]);
+    git(
+        &repository,
+        &["commit", "-m", "add tracked directory fixture"],
+    );
+    let config = write_config(&temporary, &repository);
+    let pull_request = merged_pull_request_body(
+        "feature/merged",
+        git(&repository, &["rev-parse", "HEAD"]).trim(),
+    );
+    let fake_bin = fake_gh(&temporary, &pull_request);
+    fs::remove_dir_all(repository.join("node")).expect("remove tracked directory");
+    fs::write(repository.join("node"), "preserve me\n").expect("ignored obstruction");
+
+    let output = recycle_with(&config, &fake_bin, &["--force"], &[]);
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("failed phase: tracked reset"));
+    assert!(stdout.contains("hard reset would delete ignored path node"));
+    assert_eq!(
+        fs::read_to_string(repository.join("node")).expect("ignored file remains"),
+        "preserve me\n"
+    );
+    assert_eq!(
+        git(&repository, &["branch", "--show-current"]).trim(),
+        "feature/merged"
+    );
+}
+
+#[test]
 fn force_recycle_blocks_a_dirty_branch_without_an_exact_merged_head_match() {
     let (temporary, repository) = recycle_fixture_repository();
     let config = write_config(&temporary, &repository);
