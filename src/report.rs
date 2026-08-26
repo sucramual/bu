@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use crate::adapters::{GitAdapter, GitHubAdapter};
 use crate::domain::{
-    BenchConfig, BenchDecision, BenchObservation, Config, CurrentBranch, OperationState,
+    BenchConfig, BenchDecision, BenchObservation, Config, CurrentBranch, DirtyFile, OperationState,
     PullRequestState, SkipReason, StandinState, WorktreeState, decide,
 };
 
@@ -22,12 +22,21 @@ pub enum RunItem {
         previous_branch: String,
         standin_branch: String,
         upstream_commit: String,
+        discarded_files: Vec<DirtyFile>,
     },
     Failed {
         bench: String,
         branch: Option<CurrentBranch>,
         summary: &'static str,
         error: String,
+    },
+    CleanupFailed {
+        bench: String,
+        branch: String,
+        phase: &'static str,
+        error: String,
+        remaining_files: Option<Vec<DirtyFile>>,
+        inspection_error: Option<String>,
     },
 }
 
@@ -41,7 +50,7 @@ impl RunReport {
     pub fn has_failures(&self) -> bool {
         self.items
             .iter()
-            .any(|item| matches!(item, RunItem::Failed { .. }))
+            .any(|item| matches!(item, RunItem::Failed { .. } | RunItem::CleanupFailed { .. }))
     }
 }
 
@@ -55,7 +64,12 @@ pub fn status(config: &Config, git: &GitAdapter, github: &GitHubAdapter) -> RunR
     }
 }
 
-pub fn recycle(config: &Config, git: &GitAdapter, github: &GitHubAdapter) -> RunReport {
+pub fn recycle(
+    config: &Config,
+    git: &GitAdapter,
+    github: &GitHubAdapter,
+    force: bool,
+) -> RunReport {
     if let Err(error) = git.fetch_main(
         &config.repository.path,
         &config.repository.remote,
@@ -79,7 +93,7 @@ pub fn recycle(config: &Config, git: &GitAdapter, github: &GitHubAdapter) -> Run
         items: config
             .benches
             .iter()
-            .map(|bench| recycle_item(config, bench, git, github))
+            .map(|bench| recycle_item(config, bench, git, github, force))
             .collect(),
     }
 }
@@ -112,6 +126,7 @@ fn recycle_item(
     bench: &BenchConfig,
     git: &GitAdapter,
     github: &GitHubAdapter,
+    force: bool,
 ) -> RunItem {
     let observation = match observe(config, bench, git, github) {
         Ok(observation) => observation,
@@ -125,12 +140,13 @@ fn recycle_item(
         }
     };
     let decision = decide(&observation);
-    let BenchDecision::Eligible { .. } = decision else {
+    let force_cleanup = matches!(&decision, BenchDecision::Forceable { .. });
+    if !(matches!(&decision, BenchDecision::Eligible { .. }) || force && force_cleanup) {
         return RunItem::Observed {
             observation,
             decision,
         };
-    };
+    }
 
     let recheck = match observe(config, bench, git, github) {
         Ok(observation) => observation,
@@ -147,21 +163,32 @@ fn recycle_item(
         }
     };
     let rechecked_decision = decide(&recheck);
-    let BenchDecision::Eligible {
-        branch,
-        pull_request: _,
-    } = rechecked_decision
-    else {
-        return RunItem::Observed {
-            observation: recheck,
-            decision: rechecked_decision,
-        };
+    let (branch, discarded_files) = match (force_cleanup, rechecked_decision) {
+        (false, BenchDecision::Eligible { branch, .. }) => (branch, Vec::new()),
+        (true, BenchDecision::Forceable { branch, files, .. }) => (branch, files),
+        (_, decision) => {
+            return RunItem::Observed {
+                observation: recheck,
+                decision,
+            };
+        }
+    };
+    let expected_head = match &recheck.branch {
+        CurrentBranch::Attached { name, commit } if name == &branch => commit.clone(),
+        _ => {
+            return RunItem::Failed {
+                bench: bench.path.display().to_string(),
+                branch: None,
+                summary: "pre-mutation recheck was inconsistent",
+                error: "forceable decision did not retain its attached branch and HEAD".to_owned(),
+            };
+        }
     };
 
     let StandinState::Ready {
         standin_commit,
         upstream_commit,
-    } = recheck.standin
+    } = &recheck.standin
     else {
         return RunItem::Failed {
             bench: bench.path.display().to_string(),
@@ -170,19 +197,100 @@ fn recycle_item(
             error: "eligible bench was missing a ready stand-in state".to_owned(),
         };
     };
+    let standin_commit = standin_commit.clone();
+    let upstream_commit = upstream_commit.clone();
 
     let feature_ref = format!("refs/heads/{branch}");
-    let feature_commit = match git.ref_commit(&config.repository.path, &feature_ref) {
-        Ok(commit) => commit,
-        Err(error) => {
-            return RunItem::Failed {
-                bench: bench.path.display().to_string(),
-                branch: None,
-                summary: "feature branch lookup failed",
-                error: format!("could not record feature branch before mutation: {error}"),
-            };
+    let feature_commit = expected_head;
+
+    let stash_before = if force_cleanup {
+        match git.optional_ref_commit(&config.repository.path, "refs/stash") {
+            Ok(commit) => Some(commit),
+            Err(error) => {
+                return RunItem::Failed {
+                    bench: bench.path.display().to_string(),
+                    branch: None,
+                    summary: "stash lookup failed",
+                    error: format!("could not record stash state before cleanup: {error}"),
+                };
+            }
         }
+    } else {
+        None
     };
+
+    if force_cleanup {
+        match git.current_branch(&bench.path) {
+            Ok(CurrentBranch::Attached { name, commit })
+                if name == branch && commit == feature_commit => {}
+            Ok(_) => return observed_item(config, bench, git, github),
+            Err(error) => {
+                return RunItem::Failed {
+                    bench: bench.path.display().to_string(),
+                    branch: None,
+                    summary: "pre-cleanup HEAD check failed",
+                    error: format!("could not verify HEAD immediately before cleanup: {error}"),
+                };
+            }
+        }
+        match git.operation_state(&bench.path) {
+            Ok(OperationState::Normal) => {}
+            Ok(OperationState::InProgress(_)) => {
+                return observed_item(config, bench, git, github);
+            }
+            Err(error) => {
+                return RunItem::Failed {
+                    bench: bench.path.display().to_string(),
+                    branch: None,
+                    summary: "pre-cleanup Git operation check failed",
+                    error: format!(
+                        "could not verify Git operation state immediately before cleanup: {error}"
+                    ),
+                };
+            }
+        }
+        match git.standin_state(
+            &config.repository.path,
+            &bench.path,
+            &config.repository.remote,
+            &config.repository.main_branch,
+            &bench.standin_branch,
+        ) {
+            Ok(StandinState::Ready {
+                standin_commit: current_standin,
+                upstream_commit: current_upstream,
+            }) if current_standin == standin_commit && current_upstream == upstream_commit => {}
+            Ok(_) => return observed_item(config, bench, git, github),
+            Err(error) => {
+                return RunItem::Failed {
+                    bench: bench.path.display().to_string(),
+                    branch: None,
+                    summary: "pre-cleanup stand-in check failed",
+                    error: format!(
+                        "could not verify stand-in state immediately before cleanup: {error}"
+                    ),
+                };
+            }
+        }
+        if let Err(error) = git.reset_hard(&bench.path) {
+            return cleanup_failure(bench, &branch, "tracked reset", error, git);
+        }
+        if let Err(error) = git.clean_untracked(&bench.path) {
+            return cleanup_failure(bench, &branch, "untracked cleanup", error, git);
+        }
+        if let Err(error) = verify_cleanup(
+            config,
+            bench,
+            git,
+            &branch,
+            &feature_commit,
+            stash_before
+                .as_ref()
+                .expect("force cleanup recorded stash state"),
+        ) {
+            return cleanup_failure(bench, &branch, "cleanup verification", error, git);
+        }
+    }
 
     if let Err(error) = git.advance_standin(
         &config.repository.path,
@@ -221,6 +329,7 @@ fn recycle_item(
             previous_branch: branch,
             standin_branch: bench.standin_branch.clone(),
             upstream_commit,
+            discarded_files,
         },
         Err(error) => RunItem::Failed {
             bench: bench.path.display().to_string(),
@@ -228,6 +337,69 @@ fn recycle_item(
             summary: "post-recycle verification failed",
             error: format!("recycle completed with a failed postcondition: {error}"),
         },
+    }
+}
+
+fn verify_cleanup(
+    config: &Config,
+    bench: &BenchConfig,
+    git: &GitAdapter,
+    branch: &str,
+    feature_commit: &str,
+    stash_before: &Option<String>,
+) -> Result<(), String> {
+    match git
+        .current_branch(&bench.path)
+        .map_err(|error| error.to_string())?
+    {
+        CurrentBranch::Attached { name, commit } if name == branch && commit == feature_commit => {}
+        CurrentBranch::Attached { name, commit } => {
+            return Err(format!("HEAD changed to {name} at {commit}"));
+        }
+        CurrentBranch::Detached => return Err("HEAD became detached".to_owned()),
+    }
+    if !matches!(
+        git.operation_state(&bench.path)
+            .map_err(|error| error.to_string())?,
+        OperationState::Normal
+    ) {
+        return Err("a Git operation started during cleanup".to_owned());
+    }
+    if !matches!(
+        git.worktree_state(&bench.path)
+            .map_err(|error| error.to_string())?,
+        WorktreeState::Clean
+    ) {
+        return Err("worktree is still dirty after cleanup".to_owned());
+    }
+    let stash_after = git
+        .optional_ref_commit(&config.repository.path, "refs/stash")
+        .map_err(|error| error.to_string())?;
+    if &stash_after != stash_before {
+        return Err("stash state changed during cleanup".to_owned());
+    }
+    Ok(())
+}
+
+fn cleanup_failure(
+    bench: &BenchConfig,
+    branch: &str,
+    phase: &'static str,
+    error: impl std::fmt::Display,
+    git: &GitAdapter,
+) -> RunItem {
+    let (remaining_files, inspection_error) = match git.worktree_state(&bench.path) {
+        Ok(WorktreeState::Clean) => (Some(Vec::new()), None),
+        Ok(WorktreeState::Dirty { files }) => (Some(files), None),
+        Err(inspect_error) => (None, Some(inspect_error.to_string())),
+    };
+    RunItem::CleanupFailed {
+        bench: bench.path.display().to_string(),
+        branch: branch.to_owned(),
+        phase,
+        error: error.to_string(),
+        remaining_files,
+        inspection_error,
     }
 }
 
@@ -344,22 +516,23 @@ fn observe(
         Err(error) => return Err(observation_failure(branch, "stand-in lookup failed", error)),
     };
 
-    let pull_requests = match (&worktree, &operation, &branch, &standin) {
+    let pull_requests = match (&operation, &branch, &standin) {
         (
-            WorktreeState::Clean,
             OperationState::Normal,
             CurrentBranch::Attached { name, .. },
             StandinState::Ready { .. },
-        ) => match github.pull_requests(&config.repository.path, name) {
-            Ok(state) => state,
-            Err(error) => {
-                return Err(observation_failure(
-                    branch,
-                    "pull-request lookup failed",
-                    error,
-                ));
+        ) if name != &bench.standin_branch => {
+            match github.pull_requests(&config.repository.path, name) {
+                Ok(state) => state,
+                Err(error) => {
+                    return Err(observation_failure(
+                        branch,
+                        "pull-request lookup failed",
+                        error,
+                    ));
+                }
             }
-        },
+        }
         _ => PullRequestState::NotChecked,
     };
 
@@ -403,7 +576,7 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                     observed_role_and_reason(observation, decision, StatusRole::Skipped);
                 match role {
                     StatusRole::Blocked => blocked += 1,
-                    StatusRole::Skipped => skipped += 1,
+                    StatusRole::Forceable | StatusRole::Skipped => skipped += 1,
                     StatusRole::Eligible
                     | StatusRole::Idle
                     | StatusRole::Recycled
@@ -422,6 +595,7 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                 previous_branch,
                 standin_branch,
                 upstream_commit,
+                discarded_files,
                 ..
             } => {
                 recycled += 1;
@@ -433,6 +607,9 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                     &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
                     use_color,
                 );
+                for file in discarded_files {
+                    let _ = writeln!(formatted, "    discarded: {}", dirty_file_path(file));
+                }
             }
             RunItem::Failed {
                 branch,
@@ -450,6 +627,38 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                     use_color,
                 );
                 let _ = writeln!(formatted, "    error: {error}");
+            }
+            RunItem::CleanupFailed {
+                branch,
+                phase,
+                error,
+                remaining_files,
+                inspection_error,
+                ..
+            } => {
+                failed += 1;
+                write_status_row(
+                    &mut formatted,
+                    StatusRole::Failed,
+                    &labels[index],
+                    branch,
+                    "cleanup failed; worktree may be partially cleaned",
+                    use_color,
+                );
+                let _ = writeln!(formatted, "    failed phase: {phase}");
+                let _ = writeln!(formatted, "    error: {error}");
+                if let Some(files) = remaining_files {
+                    if files.is_empty() {
+                        let _ = writeln!(formatted, "    remaining dirty paths: none");
+                    } else {
+                        for file in files {
+                            let _ = writeln!(formatted, "    remaining: {}", dirty_file_path(file));
+                        }
+                    }
+                }
+                if let Some(error) = inspection_error {
+                    let _ = writeln!(formatted, "    remaining-state inspection failed: {error}");
+                }
             }
         }
     }
@@ -479,6 +688,19 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
                 item,
                 RunItem::Observed {
                     decision: BenchDecision::Eligible { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    let forceable = report
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                RunItem::Observed {
+                    decision: BenchDecision::Forceable { .. },
                     ..
                 }
             )
@@ -524,11 +746,43 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
                     let _ = writeln!(formatted, "    error: {error}");
                 }
             }
+            RunItem::CleanupFailed {
+                bench,
+                branch,
+                phase,
+                error,
+                remaining_files,
+                inspection_error,
+            } => {
+                write_status_row(
+                    &mut formatted,
+                    StatusRole::Failed,
+                    &labels[index],
+                    branch,
+                    "cleanup failed; worktree may be partially cleaned",
+                    format.use_color,
+                );
+                if format.verbose {
+                    let _ = writeln!(formatted, "    path: {bench}");
+                    let _ = writeln!(formatted, "    failed phase: {phase}");
+                    let _ = writeln!(formatted, "    error: {error}");
+                    if let Some(files) = remaining_files {
+                        for file in files {
+                            let _ = writeln!(formatted, "    remaining: {}", dirty_file_path(file));
+                        }
+                    }
+                    if let Some(error) = inspection_error {
+                        let _ =
+                            writeln!(formatted, "    remaining-state inspection failed: {error}");
+                    }
+                }
+            }
             RunItem::Recycled {
                 bench,
                 previous_branch,
                 standin_branch,
                 upstream_commit,
+                discarded_files: _,
             } => {
                 write_status_row(
                     &mut formatted,
@@ -551,11 +805,16 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
         "benches"
     };
     let eligible_word = if eligible == 1 { "bench" } else { "benches" };
+    let forceable_word = if forceable == 1 { "bench" } else { "benches" };
     let _ = writeln!(formatted);
     let _ = writeln!(formatted, "Checked {} {bench_word}", report.items.len());
     let _ = writeln!(
         formatted,
         "{eligible} {eligible_word} eligible for `bu recycle`"
+    );
+    let _ = writeln!(
+        formatted,
+        "{forceable} {forceable_word} forceable with `bu recycle --force`"
     );
     formatted
 }
@@ -563,6 +822,7 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
 #[derive(Clone, Copy)]
 enum StatusRole {
     Eligible,
+    Forceable,
     Blocked,
     Idle,
     Recycled,
@@ -574,6 +834,7 @@ impl StatusRole {
     fn label(self) -> &'static str {
         match self {
             Self::Eligible => "eligible",
+            Self::Forceable => "forceable",
             Self::Blocked => "blocked",
             Self::Idle => "idle",
             Self::Recycled => "recycled",
@@ -585,6 +846,7 @@ impl StatusRole {
     fn ansi(self) -> &'static str {
         match self {
             Self::Eligible => "\x1b[36m",
+            Self::Forceable => "\x1b[33m",
             Self::Blocked => "\x1b[33m",
             Self::Idle => "\x1b[2;90m",
             Self::Recycled => "\x1b[32m",
@@ -627,7 +889,9 @@ fn status_labels(report: &RunReport) -> Vec<String> {
 fn item_bench_path(item: &RunItem) -> String {
     match item {
         RunItem::Observed { observation, .. } => observation.bench.path.display().to_string(),
-        RunItem::Recycled { bench, .. } | RunItem::Failed { bench, .. } => bench.clone(),
+        RunItem::Recycled { bench, .. }
+        | RunItem::Failed { bench, .. }
+        | RunItem::CleanupFailed { bench, .. } => bench.clone(),
     }
 }
 
@@ -641,18 +905,36 @@ fn observed_role_and_reason(
             StatusRole::Eligible,
             format!("merged pull request #{pull_request}"),
         ),
+        BenchDecision::Forceable {
+            pull_request,
+            files,
+            ..
+        } => {
+            let file_word = if files.len() == 1 { "file" } else { "files" };
+            let reason = if matches!(settled_role, StatusRole::Skipped) {
+                format!(
+                    "merged pull request #{pull_request}; run `bu recycle --force` to discard {} dirty {file_word}",
+                    files.len()
+                )
+            } else {
+                format!(
+                    "merged pull request #{pull_request}; dirty worktree ({} {file_word})",
+                    files.len()
+                )
+            };
+            (StatusRole::Forceable, reason)
+        }
         BenchDecision::Skip(reason) => {
             let role = match reason {
-                SkipReason::AlreadyOnStandin | SkipReason::PullRequestDoesNotMatch => settled_role,
+                SkipReason::AlreadyOnStandin => settled_role,
+                SkipReason::PullRequestDoesNotMatch
+                    if matches!(observation.worktree, WorktreeState::Clean) =>
+                {
+                    settled_role
+                }
                 _ => StatusRole::Blocked,
             };
-            let description = match (&observation.worktree, reason) {
-                (WorktreeState::Dirty { files }, SkipReason::DirtyWorktree) => {
-                    let file_word = if files.len() == 1 { "file" } else { "files" };
-                    format!("dirty worktree ({} {file_word})", files.len())
-                }
-                _ => format_skip_reason(reason),
-            };
+            let description = format_skip_reason(reason);
             (role, description)
         }
     }
@@ -709,6 +991,17 @@ fn format_path(path: &std::path::Path) -> String {
     path.to_string_lossy().escape_default().to_string()
 }
 
+fn dirty_file_path(file: &DirtyFile) -> String {
+    match &file.original_path {
+        Some(original_path) => format!(
+            "{} -> {}",
+            format_path(original_path),
+            format_path(&file.path)
+        ),
+        None => format_path(&file.path),
+    }
+}
+
 fn branch_name(branch: &CurrentBranch) -> &str {
     match branch {
         CurrentBranch::Attached { name, .. } => name,
@@ -718,7 +1011,6 @@ fn branch_name(branch: &CurrentBranch) -> &str {
 
 fn format_skip_reason(reason: &SkipReason) -> String {
     match reason {
-        SkipReason::DirtyWorktree => "worktree is dirty".to_owned(),
         SkipReason::DetachedHead => "HEAD is detached".to_owned(),
         SkipReason::AlreadyOnStandin => "already on the stand-in branch".to_owned(),
         SkipReason::OperationInProgress(operations) => format!(

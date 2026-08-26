@@ -30,6 +30,9 @@ enum Command {
     },
     /// Recycle eligible benches after guarded rechecks.
     Recycle {
+        /// Discard staged, unstaged, and untracked changes in forceable benches.
+        #[arg(long)]
+        force: bool,
         /// Control ANSI styling in recycle output.
         #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
         color: ColorMode,
@@ -81,8 +84,8 @@ fn run() -> Result<ExitCode, AppError> {
                 ExitCode::SUCCESS
             })
         }
-        Command::Recycle { color } => {
-            let report = run_recycle(&config);
+        Command::Recycle { force, color } => {
+            let report = run_recycle(&config, force);
             print!(
                 "{}",
                 format_report(

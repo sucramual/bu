@@ -262,6 +262,95 @@ impl GitAdapter {
         Ok(output.stdout.trim().to_owned())
     }
 
+    pub fn optional_ref_commit(
+        &self,
+        repository: &Path,
+        reference: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        if self.ref_exists(repository, reference)? {
+            self.ref_commit(repository, reference).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn reset_hard(&self, bench: &Path) -> Result<(), AdapterError> {
+        self.reject_ignored_reset_obstructions(bench)?;
+        let output = run_command(bench, "git", &arguments(&["reset", "--hard", "HEAD"]))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git reset", bench, output))
+        }
+    }
+
+    fn reject_ignored_reset_obstructions(&self, bench: &Path) -> Result<(), AdapterError> {
+        let ignored = run_command(
+            bench,
+            "git",
+            &arguments(&[
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "-z",
+            ]),
+        )?;
+        if !ignored.success {
+            return Err(unexpected_exit("git ls-files", bench, ignored));
+        }
+        let tracked = run_command(
+            bench,
+            "git",
+            &arguments(&["ls-tree", "-r", "--name-only", "-z", "HEAD"]),
+        )?;
+        if !tracked.success {
+            return Err(unexpected_exit("git ls-tree", bench, tracked));
+        }
+        let tracked_paths = tracked
+            .raw_stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(path_from_bytes)
+            .collect::<std::collections::HashSet<_>>();
+
+        for ignored_path in ignored
+            .raw_stdout
+            .split(|byte| *byte == b'\0')
+            .filter(|path| !path.is_empty())
+            .map(path_from_bytes)
+        {
+            let tracked_obstruction = ignored_path
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| tracked_paths.contains(*ancestor))
+                .map(Path::to_path_buf)
+                .or_else(|| {
+                    tracked_paths
+                        .iter()
+                        .find(|tracked_path| tracked_path.starts_with(&ignored_path))
+                        .cloned()
+                });
+            if let Some(tracked_path) = tracked_obstruction {
+                return Err(AdapterError::IgnoredResetObstruction {
+                    cwd: bench.to_path_buf(),
+                    ignored_path,
+                    tracked_path,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn clean_untracked(&self, bench: &Path) -> Result<(), AdapterError> {
+        let output = run_command(bench, "git", &arguments(&["clean", "-fd"]))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git clean", bench, output))
+        }
+    }
+
     pub fn fetch_main(
         &self,
         repository: &Path,
@@ -303,7 +392,11 @@ impl GitAdapter {
     }
 
     pub fn switch_branch(&self, bench: &Path, branch: &str) -> Result<(), AdapterError> {
-        let output = run_command(bench, "git", &arguments(&["switch", branch]))?;
+        let output = run_command(
+            bench,
+            "git",
+            &arguments(&["switch", "--no-overwrite-ignore", branch]),
+        )?;
         if output.success {
             Ok(())
         } else {

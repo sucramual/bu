@@ -38,7 +38,7 @@ pub enum WorktreeState {
     Dirty { files: Vec<DirtyFile> },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DirtyFile {
     pub index_status: char,
     pub worktree_status: char,
@@ -92,13 +92,20 @@ pub struct PullRequest {
 
 #[derive(Debug)]
 pub enum BenchDecision {
-    Eligible { branch: String, pull_request: u64 },
+    Eligible {
+        branch: String,
+        pull_request: u64,
+    },
+    Forceable {
+        branch: String,
+        pull_request: u64,
+        files: Vec<DirtyFile>,
+    },
     Skip(SkipReason),
 }
 
 #[derive(Debug)]
 pub enum SkipReason {
-    DirtyWorktree,
     DetachedHead,
     AlreadyOnStandin,
     OperationInProgress(Vec<GitOperation>),
@@ -111,50 +118,50 @@ pub enum SkipReason {
 }
 
 pub fn decide(observation: &BenchObservation) -> BenchDecision {
-    match observation.worktree {
-        WorktreeState::Dirty { .. } => BenchDecision::Skip(SkipReason::DirtyWorktree),
-        WorktreeState::Clean => match &observation.operation {
-            OperationState::InProgress(operations) => {
-                BenchDecision::Skip(SkipReason::OperationInProgress(operations.clone()))
-            }
-            OperationState::Normal => match &observation.branch {
-                CurrentBranch::Detached => BenchDecision::Skip(SkipReason::DetachedHead),
-                CurrentBranch::Attached { name, .. }
-                    if name == &observation.bench.standin_branch =>
-                {
-                    BenchDecision::Skip(SkipReason::AlreadyOnStandin)
-                }
-                CurrentBranch::Attached { name, commit } => match &observation.standin {
-                    StandinState::Missing => BenchDecision::Skip(SkipReason::StandinMissing),
-                    StandinState::UpstreamNotFetched => {
-                        BenchDecision::Skip(SkipReason::UpstreamNotFetched)
-                    }
-                    StandinState::NotFastForwardable => {
-                        BenchDecision::Skip(SkipReason::StandinNotFastForwardable)
-                    }
-                    StandinState::CheckedOutElsewhere(path) => {
-                        BenchDecision::Skip(SkipReason::StandinCheckedOutElsewhere(path.clone()))
-                    }
-                    StandinState::Ready { .. } => match &observation.pull_requests {
-                        PullRequestState::NotChecked => {
-                            BenchDecision::Skip(SkipReason::PullRequestNotChecked)
-                        }
-                        PullRequestState::Matches(pull_requests)
-                            if pull_requests.len() == 1
-                                && pull_requests[0].merged
-                                && pull_requests[0].head_commit == *commit =>
-                        {
-                            BenchDecision::Eligible {
-                                branch: name.clone(),
-                                pull_request: pull_requests[0].number,
-                            }
-                        }
-                        PullRequestState::Matches(_) => {
-                            BenchDecision::Skip(SkipReason::PullRequestDoesNotMatch)
-                        }
-                    },
-                },
-            },
+    let OperationState::Normal = &observation.operation else {
+        let OperationState::InProgress(operations) = &observation.operation else {
+            unreachable!()
+        };
+        return BenchDecision::Skip(SkipReason::OperationInProgress(operations.clone()));
+    };
+    let CurrentBranch::Attached { name, commit } = &observation.branch else {
+        return BenchDecision::Skip(SkipReason::DetachedHead);
+    };
+    if name == &observation.bench.standin_branch {
+        return BenchDecision::Skip(SkipReason::AlreadyOnStandin);
+    }
+    match &observation.standin {
+        StandinState::Missing => return BenchDecision::Skip(SkipReason::StandinMissing),
+        StandinState::UpstreamNotFetched => {
+            return BenchDecision::Skip(SkipReason::UpstreamNotFetched);
+        }
+        StandinState::NotFastForwardable => {
+            return BenchDecision::Skip(SkipReason::StandinNotFastForwardable);
+        }
+        StandinState::CheckedOutElsewhere(path) => {
+            return BenchDecision::Skip(SkipReason::StandinCheckedOutElsewhere(path.clone()));
+        }
+        StandinState::Ready { .. } => {}
+    }
+    let PullRequestState::Matches(pull_requests) = &observation.pull_requests else {
+        return BenchDecision::Skip(SkipReason::PullRequestNotChecked);
+    };
+    if pull_requests.len() != 1
+        || !pull_requests[0].merged
+        || pull_requests[0].head_commit != *commit
+    {
+        return BenchDecision::Skip(SkipReason::PullRequestDoesNotMatch);
+    }
+
+    match &observation.worktree {
+        WorktreeState::Clean => BenchDecision::Eligible {
+            branch: name.clone(),
+            pull_request: pull_requests[0].number,
+        },
+        WorktreeState::Dirty { files } => BenchDecision::Forceable {
+            branch: name.clone(),
+            pull_request: pull_requests[0].number,
+            files: files.clone(),
         },
     }
 }
@@ -192,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_worktree_wins_over_other_eligibility_signals() {
+    fn dirty_exact_match_is_forceable() {
         let mut observation = observation();
         observation.worktree = WorktreeState::Dirty {
             files: vec![super::DirtyFile {
@@ -205,7 +212,10 @@ mod tests {
 
         assert!(matches!(
             decide(&observation),
-            BenchDecision::Skip(SkipReason::DirtyWorktree)
+            BenchDecision::Forceable {
+                pull_request: 42,
+                ..
+            }
         ));
     }
 
