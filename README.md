@@ -48,7 +48,7 @@ Use `bu --config /path/to/config.toml status` to test a fixed configuration with
 
 ## Safety model
 
-`status` only runs read-only Git and GitHub queries. When the default config is used, it may create the file or append newly discovered benches before reporting each managed bench as eligible, forceable, blocked, idle, or failed. Ordinary forceable, blocked, and idle benches do not make the command fail.
+`status` only runs read-only Git and GitHub queries. When the default config is used, it may create the file or append newly discovered benches before reporting each managed bench as merged (and eligible to recycle), forceable, blocked, idle, or failed. Ordinary forceable, blocked, and idle benches do not make the command fail.
 
 `recycle` first fetches `origin/main`. For each eligible bench, it rechecks cleanliness, normal Git operation state, branch attachment, one merged pull request, stand-in ownership, and fast-forwardability. It then atomically advances only the stand-in ref, switches to it without discarding changes, and verifies that the feature ref is unchanged and the worktree is clean.
 

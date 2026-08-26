@@ -604,7 +604,9 @@ pub fn format_report(report: &RunReport, use_color: bool) -> String {
                     StatusRole::Recycled,
                     &labels[index],
                     standin_branch,
-                    &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
+                    &format!(
+                        "{previous_branch} merged; preserved; {standin_branch} -> {upstream_commit}"
+                    ),
                     use_color,
                 );
                 for file in discarded_files {
@@ -789,7 +791,9 @@ pub fn format_status_report(report: &RunReport, format: StatusFormat) -> String 
                     StatusRole::Idle,
                     &labels[index],
                     standin_branch,
-                    &format!("{previous_branch} preserved; {standin_branch} -> {upstream_commit}"),
+                    &format!(
+                        "{previous_branch} merged; preserved; {standin_branch} -> {upstream_commit}"
+                    ),
                     format.use_color,
                 );
                 if format.verbose {
@@ -833,7 +837,7 @@ enum StatusRole {
 impl StatusRole {
     fn label(self) -> &'static str {
         match self {
-            Self::Eligible => "eligible",
+            Self::Eligible => "merged",
             Self::Forceable => "forceable",
             Self::Blocked => "blocked",
             Self::Idle => "idle",

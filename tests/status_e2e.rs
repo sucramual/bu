@@ -526,7 +526,7 @@ fn status_reports_an_eligible_bench_without_changing_git_state() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("▎ eligible repository feature/merged merged pull request #42\n"));
+    assert!(stdout.contains("▎ merged   repository feature/merged merged pull request #42\n"));
     assert!(stdout.contains("\nChecked 1 bench\n1 bench eligible for `bu recycle`\n"));
     assert!(!stdout.contains('\x1b'));
     assert_eq!(
@@ -554,7 +554,7 @@ fn status_color_policy_styles_only_the_marker_and_honors_overrides() {
     );
     assert!(always.status.success());
     let always_stdout = String::from_utf8_lossy(&always.stdout);
-    assert!(always_stdout.contains("\x1b[36m▎\x1b[0m eligible repository"));
+    assert!(always_stdout.contains("\x1b[36m▎\x1b[0m merged   repository"));
     assert_eq!(always_stdout.matches('\x1b').count(), 2);
 
     let never = status_with(
@@ -670,7 +670,7 @@ fn force_recycle_discards_tracked_and_untracked_changes_but_preserves_ignored_an
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("▎ recycled repository main-01 feature/merged preserved"));
+    assert!(stdout.contains("▎ recycled repository main-01 feature/merged merged; preserved"));
     assert!(stdout.contains("    discarded: README.md\n"));
     assert!(stdout.contains("    discarded: STAGED.md\n"));
     assert!(stdout.contains("    discarded: UNTRACKED.md\n"));
@@ -1132,7 +1132,11 @@ fn recycle_fast_forwards_the_standin_and_preserves_the_feature_ref() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("▎ recycled repository main-01 feature/merged preserved; main-01 -> "));
+    assert!(
+        stdout.contains(
+            "▎ recycled repository main-01 feature/merged merged; preserved; main-01 -> "
+        )
+    );
     assert!(stdout.contains("\n1 recycled, 0 blocked, 0 skipped, 0 failed\n"));
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
@@ -1247,7 +1251,7 @@ fn recycle_continues_after_one_bench_fails() {
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("▎ failed   missing-bench unknown repository check failed"));
-    assert!(stdout.contains("▎ recycled repository main-01 feature/merged preserved"));
+    assert!(stdout.contains("▎ recycled repository main-01 feature/merged merged; preserved"));
     assert_eq!(
         git(&repository, &["branch", "--show-current"]).trim(),
         "main-01"
