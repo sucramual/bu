@@ -135,10 +135,12 @@ fn write_executable(path: &Path, source: &str) {
 }
 
 /// Fake `gh`: every branch has one merged pull request at its local tip unless a
-/// branch-specific case below says otherwise.
+/// branch-specific case below says otherwise. Also installs a fake `lsof` that
+/// reports no processes, so tests never depend on the host's process table.
 fn fake_gh(temporary: &TempDir) -> PathBuf {
     let bin = temporary.path().join("bin");
     fs::create_dir(&bin).expect("bin directory");
+    fake_lsof(&bin, "exit 0");
     write_executable(
         &bin.join("gh"),
         &format!(
@@ -179,6 +181,21 @@ fn fake_git(bin: &Path, body: &str) {
         &bin.join("git"),
         &format!("#!/bin/sh\n{body}\nexec \"{}\" \"$@\"\n", real_git()),
     );
+}
+
+/// Replaces `lsof` with `body`. `$PPID` inside `body` is the pid of `bu`.
+fn fake_lsof(bin: &Path, body: &str) {
+    write_executable(&bin.join("lsof"), &format!("#!/bin/sh\n{body}\n"));
+}
+
+/// One `lsof -Fpcn` record for a process whose current directory is `cwd`.
+fn lsof_record(pid: &str, command: &str, cwd: &Path) -> String {
+    format!("p{pid}\nc{command}\nfcwd\nn{}\n", cwd.display())
+}
+
+/// A fake `lsof` body that prints `records` and exits with `status`.
+fn lsof_printing(records: &str, status: u8) -> String {
+    format!("cat <<'EOF'\n{records}EOF\nexit {status}")
 }
 
 fn bu_command(fake_bin: &Path) -> Command {
@@ -670,6 +687,7 @@ fn prune_rechecks_each_worktree_immediately_before_removing_it() {
     let config = write_repository_config(&temporary, &repository);
     let bin = temporary.path().join("bin");
     fs::create_dir(&bin).expect("bin directory");
+    fake_lsof(&bin, "exit 0");
     write_executable(
         &bin.join("gh"),
         &format!(
@@ -906,4 +924,282 @@ fi"#,
     assert!(stdout.contains("1 pruned, 0 cleaned, 0 kept, 0 blocked, 0 skipped, 0 failed\n"));
     assert!(!scratch.exists());
     assert!(!ref_exists(&repository, "refs/heads/scratch/done"));
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).expect("canonical path")
+}
+
+#[test]
+fn prune_blocks_worktrees_that_a_live_process_uses_in_dry_run_and_real_run() {
+    let (temporary, repository) = prune_fixture();
+    let busy = add_scratch(&repository, "busy", "scratch/busy");
+    let nested = add_scratch(&repository, "nested-cwd", "scratch/nested-cwd");
+    fs::create_dir_all(nested.join("docs/site")).expect("empty subdirectory");
+    let own = add_scratch(&repository, "own", "scratch/own");
+    let free = add_scratch(&repository, "free", "scratch/free");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    // The subdirectory record uses the uncanonicalized temp path (for example
+    // `/var` instead of `/private/var` on macOS); bu must still match it.
+    let records = [
+        lsof_record("4242", "node", &canonical(&busy)),
+        lsof_record("4243", "esbuild", &canonical(&busy).join("docs")),
+        lsof_record("4244", "node", &canonical(&busy)),
+        lsof_record("5001", "node", &nested.join("docs/site")),
+    ]
+    .concat();
+    fake_lsof(
+        &fake_bin,
+        &format!(
+            "printf 'p%s\\ncbu\\nfcwd\\nn%s\\n' \"$PPID\" '{own}'\n{body}",
+            own = canonical(&own).display(),
+            body = lsof_printing(&records, 0),
+        ),
+    );
+    let worktrees_before = registered_worktrees(&repository);
+    let refs_before = git(&repository, &["show-ref"]);
+
+    let dry_run = prune(&config, &fake_bin, &["--dry-run"]);
+
+    assert_success(&dry_run);
+    let dry_stdout = stdout(&dry_run);
+    for expected in [
+        "▎ blocked  scratch-busy scratch/busy in use by 3 processes (esbuild, node)\n",
+        "▎ blocked  scratch-nested-cwd scratch/nested-cwd in use by 1 process (node)\n",
+        "▎ prunable scratch-own scratch/own merged pull request #42; would remove worktree and branch\n",
+        "▎ prunable scratch-free scratch/free merged pull request #42; would remove worktree and branch\n",
+        "\nChecked 4 scratch worktrees\n2 prunable, 0 stale, 2 blocked, 0 skipped, 0 failed\n",
+    ] {
+        assert!(
+            dry_stdout.contains(expected),
+            "missing {expected:?} in\n{dry_stdout}"
+        );
+    }
+    assert_eq!(registered_worktrees(&repository), worktrees_before);
+    assert_eq!(git(&repository, &["show-ref"]), refs_before);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    for expected in [
+        "▎ blocked  scratch-busy scratch/busy in use by 3 processes (esbuild, node)\n",
+        "▎ blocked  scratch-nested-cwd scratch/nested-cwd in use by 1 process (node)\n",
+        "▎ pruned   scratch-own scratch/own",
+        "▎ pruned   scratch-free scratch/free",
+        "2 pruned, 0 cleaned, 0 kept, 2 blocked, 0 skipped, 0 failed\n",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in\n{stdout}"
+        );
+    }
+    assert!(busy.exists());
+    assert!(nested.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/busy"));
+    assert!(ref_exists(&repository, "refs/heads/scratch/nested-cwd"));
+    assert!(!own.exists());
+    assert!(!free.exists());
+}
+
+#[test]
+fn prune_matches_process_directories_on_path_component_boundaries() {
+    let (temporary, repository) = prune_fixture();
+    let short = add_scratch(&repository, "wt", "scratch/wt");
+    let longer = add_scratch(&repository, "wt-2", "scratch/wt-2");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_lsof(
+        &fake_bin,
+        &lsof_printing(&lsof_record("4242", "node", &canonical(&longer)), 0),
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("▎ pruned   scratch-wt scratch/wt merged pull request #42"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("▎ blocked  scratch-wt-2 scratch/wt-2 in use by 1 process (node)\n"),
+        "{stdout}"
+    );
+    assert!(!short.exists());
+    assert!(longer.exists());
+}
+
+#[test]
+fn prune_accepts_lsof_output_when_lsof_exits_one_after_printing_records() {
+    let (temporary, repository) = prune_fixture();
+    let busy = add_scratch(&repository, "busy", "scratch/busy");
+    let free = add_scratch(&repository, "free", "scratch/free");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_lsof(
+        &fake_bin,
+        &format!(
+            "printf 'lsof: WARNING: can not inspect some processes\\n' >&2\n{}",
+            lsof_printing(&lsof_record("4242", "node", &canonical(&busy)), 1)
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("▎ blocked  scratch-busy scratch/busy in use by 1 process (node)\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("▎ pruned   scratch-free scratch/free"),
+        "{stdout}"
+    );
+    assert!(busy.exists());
+    assert!(!free.exists());
+}
+
+#[test]
+fn prune_changes_nothing_and_exits_nonzero_when_the_process_check_fails() {
+    for (case, body) in [
+        (
+            "exit one without output",
+            "printf 'lsof: simulated failure\\n' >&2\nexit 1",
+        ),
+        ("other nonzero exit", "printf 'p1\\ncinit\\n'\nexit 2"),
+    ] {
+        let (temporary, repository) = prune_fixture();
+        let done = add_scratch(&repository, "done", "scratch/done");
+        let gone = add_scratch(&repository, "gone", "scratch/gone");
+        fs::remove_dir_all(&gone).expect("remove worktree folder");
+        let config = write_repository_config(&temporary, &repository);
+        let fake_bin = fake_gh(&temporary);
+        fake_lsof(&fake_bin, body);
+        let worktrees_before = registered_worktrees(&repository);
+        let refs_before = git(&repository, &["show-ref"]);
+
+        let output = prune(&config, &fake_bin, &[]);
+
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        let stdout = stdout(&output);
+        assert!(
+            stdout.contains("▎ failed   repository unknown process check failed\n    error: "),
+            "{case}: {stdout}"
+        );
+        assert!(stdout.contains("lsof"), "{case}: {stdout}");
+        assert!(done.exists(), "{case}");
+        assert_eq!(
+            registered_worktrees(&repository),
+            worktrees_before,
+            "{case}"
+        );
+        assert_eq!(git(&repository, &["show-ref"]), refs_before, "{case}");
+    }
+}
+
+#[test]
+fn prune_rechecks_live_processes_immediately_before_removing_a_worktree() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "raced", "scratch/raced");
+    let counter = temporary.path().join("lsof-count");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_lsof(
+        &fake_bin,
+        &format!(
+            r#"count_file='{counter}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+printf '%s' "$((count + 1))" > "$count_file"
+if [ "$count" -eq 0 ]; then
+  printf 'p1\ncinit\nfcwd\nn/\n'
+  exit 0
+fi
+{late}"#,
+            counter = counter.display(),
+            late = lsof_printing(&lsof_record("4242", "node", &canonical(&scratch)), 0),
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    assert!(
+        stdout(&output)
+            .contains("▎ blocked  scratch-raced scratch/raced in use by 1 process (node)\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(fs::read_to_string(&counter).expect("lsof count"), "2");
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/raced"));
+}
+
+#[test]
+fn prune_fails_the_worktree_when_the_pre_removal_process_check_fails() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "raced", "scratch/raced");
+    let counter = temporary.path().join("lsof-count");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_lsof(
+        &fake_bin,
+        &format!(
+            r#"count_file='{counter}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+printf '%s' "$((count + 1))" > "$count_file"
+if [ "$count" -eq 0 ]; then
+  printf 'p1\ncinit\nfcwd\nn/\n'
+  exit 0
+fi
+printf 'lsof: simulated recheck failure\n' >&2
+exit 1"#,
+            counter = counter.display(),
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("▎ failed   scratch-raced scratch/raced pre-removal recheck failed\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("process check failed: "), "{stdout}");
+    assert!(stdout.contains("simulated recheck failure"), "{stdout}");
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/raced"));
+}
+
+/// Uses the host's real `lsof` against a real child process, so the parser and
+/// path canonicalization are checked against genuine output.
+#[test]
+fn prune_blocks_a_worktree_that_a_real_process_uses_as_its_current_directory() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "sleeping", "scratch/sleeping");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fs::remove_file(fake_bin.join("lsof")).expect("use the real lsof");
+    let mut sleeper = Command::new("sleep")
+        .arg("60")
+        .current_dir(&scratch)
+        .spawn()
+        .expect("sleep should start");
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    sleeper.kill().expect("stop sleep");
+    sleeper.wait().expect("reap sleep");
+    assert_success(&output);
+    assert!(
+        stdout(&output)
+            .contains("▎ blocked  scratch-sleeping scratch/sleeping in use by 1 process (sleep)\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/sleeping"));
 }
