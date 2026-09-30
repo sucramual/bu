@@ -86,8 +86,21 @@ pub enum PullRequestState {
 #[derive(Debug)]
 pub struct PullRequest {
     pub number: u64,
-    pub merged: bool,
+    pub lifecycle: PullRequestLifecycle,
     pub head_commit: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequestLifecycle {
+    Open,
+    Merged,
+    ClosedUnmerged,
+}
+
+impl PullRequest {
+    pub fn is_merged(&self) -> bool {
+        self.lifecycle == PullRequestLifecycle::Merged
+    }
 }
 
 #[derive(Debug)]
@@ -147,7 +160,7 @@ pub fn decide(observation: &BenchObservation) -> BenchDecision {
         return BenchDecision::Skip(SkipReason::PullRequestNotChecked);
     };
     if pull_requests.len() != 1
-        || !pull_requests[0].merged
+        || !pull_requests[0].is_merged()
         || pull_requests[0].head_commit != *commit
     {
         return BenchDecision::Skip(SkipReason::PullRequestDoesNotMatch);
@@ -163,6 +176,224 @@ pub fn decide(observation: &BenchObservation) -> BenchDecision {
             pull_request: pull_requests[0].number,
             files: files.clone(),
         },
+    }
+}
+
+/// Branches that `bu prune` never deletes: the configured main branch and every
+/// bench stand-in branch.
+#[derive(Debug)]
+pub struct ProtectedBranches {
+    pub main_branch: String,
+    pub standin_branches: Vec<String>,
+}
+
+impl ProtectedBranches {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            main_branch: config.repository.main_branch.clone(),
+            standin_branches: config
+                .benches
+                .iter()
+                .map(|bench| bench.standin_branch.clone())
+                .collect(),
+        }
+    }
+
+    fn protection(&self, branch: &str) -> Option<BranchProtection> {
+        if branch == self.main_branch {
+            Some(BranchProtection::MainBranch)
+        } else if self
+            .standin_branches
+            .iter()
+            .any(|standin| standin == branch)
+        {
+            Some(BranchProtection::StandinBranch)
+        } else {
+            None
+        }
+    }
+}
+
+/// Git state of one existing, unlocked scratch worktree.
+#[derive(Debug)]
+pub struct ScratchObservation {
+    pub worktree: WorktreeState,
+    pub branch: CurrentBranch,
+    pub operation: OperationState,
+    pub pull_requests: PullRequestState,
+}
+
+#[derive(Debug)]
+pub enum ScratchDecision {
+    Prunable {
+        branch: String,
+        commit: String,
+        pull_request: u64,
+    },
+    Skip(PruneSkipReason),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BranchProtection {
+    MainBranch,
+    StandinBranch,
+}
+
+#[derive(Debug)]
+pub enum PruneSkipReason {
+    Locked,
+    ContainsCurrentDirectory,
+    OperationInProgress(Vec<GitOperation>),
+    DetachedHead,
+    ProtectedBranch {
+        branch: String,
+        protection: BranchProtection,
+    },
+    Dirty(Vec<DirtyFile>),
+    PullRequestNotChecked,
+    NoPullRequest,
+    OpenPullRequest(u64),
+    ClosedPullRequest(u64),
+    AmbiguousPullRequests(usize),
+    HeadMismatch {
+        pull_request: u64,
+        pull_request_head: String,
+        local_head: String,
+    },
+}
+
+/// Returns whether local pull-request lookup is worth doing: every local check
+/// already passes and only the GitHub proof remains.
+pub fn scratch_needs_pull_requests(
+    worktree: &WorktreeState,
+    branch: &CurrentBranch,
+    operation: &OperationState,
+    protected: &ProtectedBranches,
+) -> bool {
+    matches!(operation, OperationState::Normal)
+        && matches!(worktree, WorktreeState::Clean)
+        && matches!(branch, CurrentBranch::Attached { name, .. } if protected.protection(name).is_none())
+}
+
+pub fn decide_scratch(
+    observation: &ScratchObservation,
+    protected: &ProtectedBranches,
+) -> ScratchDecision {
+    if let OperationState::InProgress(operations) = &observation.operation {
+        return ScratchDecision::Skip(PruneSkipReason::OperationInProgress(operations.clone()));
+    }
+    let CurrentBranch::Attached { name, commit } = &observation.branch else {
+        return ScratchDecision::Skip(PruneSkipReason::DetachedHead);
+    };
+    if let Some(protection) = protected.protection(name) {
+        return ScratchDecision::Skip(PruneSkipReason::ProtectedBranch {
+            branch: name.clone(),
+            protection,
+        });
+    }
+    if let WorktreeState::Dirty { files } = &observation.worktree {
+        return ScratchDecision::Skip(PruneSkipReason::Dirty(files.clone()));
+    }
+    let PullRequestState::Matches(pull_requests) = &observation.pull_requests else {
+        return ScratchDecision::Skip(PruneSkipReason::PullRequestNotChecked);
+    };
+    if let Some(open) = pull_requests
+        .iter()
+        .find(|pull_request| pull_request.lifecycle == PullRequestLifecycle::Open)
+    {
+        return ScratchDecision::Skip(PruneSkipReason::OpenPullRequest(open.number));
+    }
+    let merged: Vec<_> = pull_requests
+        .iter()
+        .filter(|pull_request| pull_request.is_merged())
+        .collect();
+    match merged.as_slice() {
+        [] => ScratchDecision::Skip(match pull_requests.first() {
+            Some(closed) => PruneSkipReason::ClosedPullRequest(closed.number),
+            None => PruneSkipReason::NoPullRequest,
+        }),
+        [pull_request] if pull_request.head_commit == *commit => ScratchDecision::Prunable {
+            branch: name.clone(),
+            commit: commit.clone(),
+            pull_request: pull_request.number,
+        },
+        [pull_request] => ScratchDecision::Skip(PruneSkipReason::HeadMismatch {
+            pull_request: pull_request.number,
+            pull_request_head: pull_request.head_commit.clone(),
+            local_head: commit.clone(),
+        }),
+        many => ScratchDecision::Skip(PruneSkipReason::AmbiguousPullRequests(many.len())),
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::{
+        CurrentBranch, OperationState, ProtectedBranches, PruneSkipReason, PullRequest,
+        PullRequestLifecycle, PullRequestState, ScratchDecision, ScratchObservation, WorktreeState,
+        decide_scratch,
+    };
+
+    fn protected() -> ProtectedBranches {
+        ProtectedBranches {
+            main_branch: "main".to_owned(),
+            standin_branches: vec!["main-01".to_owned()],
+        }
+    }
+
+    fn observation(pull_requests: Vec<PullRequest>) -> ScratchObservation {
+        ScratchObservation {
+            worktree: WorktreeState::Clean,
+            branch: CurrentBranch::Attached {
+                name: "scratch/one".to_owned(),
+                commit: "tip".to_owned(),
+            },
+            operation: OperationState::Normal,
+            pull_requests: PullRequestState::Matches(pull_requests),
+        }
+    }
+
+    fn pull_request(number: u64, lifecycle: PullRequestLifecycle, head: &str) -> PullRequest {
+        PullRequest {
+            number,
+            lifecycle,
+            head_commit: head.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_closed_attempt_does_not_block_a_later_exact_merge() {
+        let decision = decide_scratch(
+            &observation(vec![
+                pull_request(1, PullRequestLifecycle::ClosedUnmerged, "old"),
+                pull_request(2, PullRequestLifecycle::Merged, "tip"),
+            ]),
+            &protected(),
+        );
+
+        assert!(matches!(
+            decision,
+            ScratchDecision::Prunable {
+                pull_request: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_open_pull_request_blocks_even_beside_an_exact_merge() {
+        let decision = decide_scratch(
+            &observation(vec![
+                pull_request(1, PullRequestLifecycle::Merged, "tip"),
+                pull_request(2, PullRequestLifecycle::Open, "tip"),
+            ]),
+            &protected(),
+        );
+
+        assert!(matches!(
+            decision,
+            ScratchDecision::Skip(PruneSkipReason::OpenPullRequest(2))
+        ));
     }
 }
 
@@ -192,7 +423,7 @@ mod tests {
             },
             pull_requests: PullRequestState::Matches(vec![super::PullRequest {
                 number: 42,
-                merged: true,
+                lifecycle: super::PullRequestLifecycle::Merged,
                 head_commit: "feature-commit".to_owned(),
             }]),
         }

@@ -3,13 +3,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bu::{
-    AppError, StatusFormat, format_report, format_status_report, load_config, run_recycle,
-    run_status,
+    AppError, PruneFormat, StatusFormat, format_prune_report, format_report, format_status_report,
+    load_config, run_prune, run_recycle, run_status,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(about = "Report and safely recycle durable Git worktree benches")]
+#[command(
+    about = "Report and safely recycle durable Git worktree benches and prune merged scratch worktrees"
+)]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -34,6 +36,18 @@ enum Command {
         #[arg(long)]
         force: bool,
         /// Control ANSI styling in recycle output.
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+    },
+    /// Remove scratch worktrees whose exact HEAD is a merged pull request.
+    Prune {
+        /// Classify scratch worktrees without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Include full worktree paths and dirty files.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Control ANSI styling in prune output.
         #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
         color: ColorMode,
     },
@@ -95,6 +109,32 @@ fn run() -> Result<ExitCode, AppError> {
                         std::io::stdout().is_terminal(),
                         std::env::var_os("NO_COLOR").is_some()
                     ),
+                )
+            );
+            Ok(if report.has_failures() {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
+        Command::Prune {
+            dry_run,
+            verbose,
+            color,
+        } => {
+            let report = run_prune(&config, dry_run);
+            print!(
+                "{}",
+                format_prune_report(
+                    &report,
+                    PruneFormat {
+                        verbose,
+                        use_color: resolve_color(
+                            color,
+                            std::io::stdout().is_terminal(),
+                            std::env::var_os("NO_COLOR").is_some()
+                        ),
+                    },
                 )
             );
             Ok(if report.has_failures() {
