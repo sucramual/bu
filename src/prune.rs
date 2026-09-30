@@ -1,9 +1,12 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
-use crate::adapters::{CwdProcess, GitAdapter, GitHubAdapter, GitWorktree, ProcessAdapter};
+use crate::adapters::{
+    CwdProcess, GitAdapter, GitHubAdapter, GitWorktree, ProcessAdapter, ScratchHead,
+};
 use crate::domain::{
     BranchProtection, Config, CurrentBranch, ProtectedBranches, PruneSkipReason, PullRequestState,
     ScratchDecision, ScratchObservation, decide_scratch, scratch_needs_pull_requests,
@@ -148,9 +151,70 @@ pub fn prune(
             );
         }
     };
-    // Without a process list, every worktree might be in use, so nothing is safe.
-    let live = match live_processes(processes, repository) {
-        Ok(live) => live,
+    let excluded = ExcludedWorktrees::new(config, &worktrees);
+    let protected = ProtectedBranches::from_config(config);
+    let current_directory = std::env::current_dir().ok().map(|path| canonical(&path));
+
+    let mut candidates: Vec<(&GitWorktree, Option<PruneOutcome>)> = worktrees
+        .iter()
+        .skip(1)
+        .filter(|worktree| !worktree.bare && !excluded.contains(&worktree.path))
+        .map(|worktree| {
+            let outcome = if worktree.locked {
+                Some(PruneOutcome::Skipped(PruneSkipReason::Locked))
+            } else if !worktree.path.exists() {
+                Some(PruneOutcome::Stale)
+            } else if current_directory
+                .as_deref()
+                .is_some_and(|directory| directory.starts_with(canonical(&worktree.path)))
+            {
+                Some(PruneOutcome::Skipped(
+                    PruneSkipReason::ContainsCurrentDirectory,
+                ))
+            } else {
+                None
+            };
+            (worktree, outcome)
+        })
+        .collect();
+    // Asks about every branch that passed the cheap checks, including branches
+    // of worktrees the process check blocks next. Their answers go unused.
+    let listed_branches: Vec<&str> = candidates
+        .iter()
+        .filter(|(_, outcome)| outcome.is_none())
+        .filter_map(|(worktree, _)| worktree.branch.as_deref())
+        .filter(|branch| protected.protection(branch).is_none())
+        .collect();
+    let classified: Result<_, AdapterError> = thread::scope(|scope| {
+        // Started first, so the network round trip overlaps `lsof` and the Git
+        // observations instead of following them.
+        let lookup = (!listed_branches.is_empty()).then(|| {
+            scope.spawn(|| github.pull_requests_for_branches(repository, &listed_branches))
+        });
+        let live = live_processes(processes, repository)?;
+        for (worktree, outcome) in &mut candidates {
+            if outcome.is_none() {
+                *outcome = in_use(&worktree.path, &live).map(PruneOutcome::Skipped);
+            }
+        }
+        let scratch: Vec<&GitWorktree> = candidates
+            .iter()
+            .filter(|(_, outcome)| outcome.is_none())
+            .map(|(worktree, _)| *worktree)
+            .collect();
+        Ok(classify_concurrently(
+            git,
+            github,
+            repository,
+            &scratch,
+            &protected,
+            &listed_branches,
+            lookup,
+        ))
+    });
+    let mut classified = match classified {
+        Ok(classified) => classified.into_iter(),
+        // Without a process list, every worktree might be in use, so nothing is safe.
         Err(error) => {
             return run_failure(
                 "process check failed",
@@ -158,49 +222,25 @@ pub fn prune(
             );
         }
     };
-    let excluded = ExcludedWorktrees::new(config, &worktrees);
-    let protected = ProtectedBranches::from_config(config);
-    let current_directory = std::env::current_dir().ok().map(|path| canonical(&path));
 
     let mut items = Vec::new();
     let mut stale = Vec::new();
     let mut prunable = Vec::new();
-    for worktree in worktrees
-        .iter()
-        .skip(1)
-        .filter(|worktree| !worktree.bare && !excluded.contains(&worktree.path))
-    {
-        let branch = worktree
-            .branch
-            .clone()
-            .unwrap_or_else(|| "detached".to_owned());
-        let outcome = if worktree.locked {
-            PruneOutcome::Skipped(PruneSkipReason::Locked)
-        } else if !worktree.path.exists() {
-            stale.push(items.len());
-            PruneOutcome::Stale
-        } else if current_directory
-            .as_deref()
-            .is_some_and(|directory| directory.starts_with(canonical(&worktree.path)))
-        {
-            PruneOutcome::Skipped(PruneSkipReason::ContainsCurrentDirectory)
-        } else if let Some(reason) = in_use(&worktree.path, &live) {
-            PruneOutcome::Skipped(reason)
-        } else {
-            match observe_scratch(git, github, repository, &worktree.path, &protected) {
-                Err(failure) => failure,
-                Ok(observation) => match decide_scratch(&observation, &protected) {
-                    ScratchDecision::Prunable { pull_request, .. } => {
-                        prunable.push(items.len());
-                        PruneOutcome::Prunable { pull_request }
-                    }
-                    ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
-                },
-            }
-        };
+    for (worktree, outcome) in candidates {
+        let outcome = outcome
+            .or_else(|| classified.next())
+            .expect("one classification per scratch worktree");
+        match outcome {
+            PruneOutcome::Stale => stale.push(items.len()),
+            PruneOutcome::Prunable { .. } => prunable.push(items.len()),
+            _ => {}
+        }
         items.push(PruneItem {
             path: worktree.path.clone(),
-            branch,
+            branch: worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "detached".to_owned()),
             outcome,
         });
     }
@@ -247,6 +287,115 @@ pub fn prune(
         dry_run,
         run_failure: None,
         items,
+    }
+}
+
+/// Caps concurrent Git observations so one prune run does not start an
+/// unbounded number of `git status` processes.
+const MAX_OBSERVATION_THREADS: usize = 8;
+
+/// The pull-request lookup that `prune` starts before the process check.
+type PrefetchHandle<'scope> =
+    thread::ScopedJoinHandle<'scope, Result<Vec<PullRequestState>, AdapterError>>;
+
+/// Observes scratch worktrees in parallel, because each one waits on Git
+/// commands. `lookup`, already running on its own thread, asks GitHub about
+/// `listed_branches`, so the lookup overlaps the Git work instead of following
+/// it. Outcomes keep the order of `scratch`.
+fn classify_concurrently(
+    git: &GitAdapter,
+    github: &GitHubAdapter,
+    repository: &Path,
+    scratch: &[&GitWorktree],
+    protected: &ProtectedBranches,
+    listed_branches: &[&str],
+    lookup: Option<PrefetchHandle<'_>>,
+) -> Vec<PruneOutcome> {
+    let chunk_size = scratch.len().div_ceil(MAX_OBSERVATION_THREADS).max(1);
+    let (mut observations, prefetched): (Vec<_>, _) = thread::scope(|scope| {
+        let workers: Vec<_> = scratch
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|worktree| observe_scratch_git(git, &worktree.path))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let observations = workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect();
+        let prefetched = lookup.map(|lookup| {
+            lookup
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        (observations, prefetched)
+    });
+    let prefetched = match prefetched {
+        None => Prefetched::default(),
+        Some(result) => Prefetched::new(listed_branches, result),
+    };
+    attach_pull_requests(github, repository, &mut observations, protected, prefetched);
+    observations
+        .into_iter()
+        .map(|observation| match observation {
+            Err(failure) => failure,
+            Ok(observation) => match decide_scratch(&observation, protected) {
+                ScratchDecision::Prunable { pull_request, .. } => {
+                    PruneOutcome::Prunable { pull_request }
+                }
+                ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
+            },
+        })
+        .collect()
+}
+
+/// Pull requests fetched before the Git observations finished, keyed by
+/// branch name, or the error that fetch hit for those branches.
+#[derive(Default)]
+struct Prefetched {
+    states: HashMap<String, PullRequestState>,
+    failure: Option<(HashSet<String>, String)>,
+}
+
+impl Prefetched {
+    fn new(branches: &[&str], result: Result<Vec<PullRequestState>, AdapterError>) -> Self {
+        match result {
+            Ok(states) => Self {
+                states: branches
+                    .iter()
+                    .map(|branch| (*branch).to_owned())
+                    .zip(states)
+                    .collect(),
+                failure: None,
+            },
+            Err(error) => Self {
+                states: HashMap::new(),
+                failure: Some((
+                    branches.iter().map(|branch| (*branch).to_owned()).collect(),
+                    error.to_string(),
+                )),
+            },
+        }
+    }
+
+    /// Takes the answer for `branch`, if the prefetch asked about it.
+    fn take(&mut self, branch: &str) -> Option<Result<PullRequestState, String>> {
+        if let Some(state) = self.states.remove(branch) {
+            return Some(Ok(state));
+        }
+        match &self.failure {
+            Some((branches, error)) if branches.contains(branch) => Some(Err(error.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -440,14 +589,33 @@ fn observe_scratch(
     path: &Path,
     protected: &ProtectedBranches,
 ) -> Result<ScratchObservation, PruneOutcome> {
+    let mut observations = [observe_scratch_git(git, path)];
+    attach_pull_requests(
+        github,
+        repository,
+        &mut observations,
+        protected,
+        Prefetched::default(),
+    );
+    let [observation] = observations;
+    observation
+}
+
+/// Reads everything but the pull requests, which stay `NotChecked` until
+/// `attach_pull_requests` fills them.
+fn observe_scratch_git(git: &GitAdapter, path: &Path) -> Result<ScratchObservation, PruneOutcome> {
     let failed = |summary: &'static str| {
         move |error: crate::error::AdapterError| PruneOutcome::Failed {
             summary,
             error: error.to_string(),
         }
     };
-    let toplevel = git
-        .toplevel(path)
+    let ScratchHead {
+        toplevel,
+        branch,
+        operation,
+    } = git
+        .scratch_head(path)
         .map_err(failed("worktree root check failed"))?;
     if toplevel != canonical(path) {
         return Err(PruneOutcome::Failed {
@@ -458,31 +626,70 @@ fn observe_scratch(
             ),
         });
     }
-    let branch = git
-        .current_branch(path)
-        .map_err(failed("branch lookup failed"))?;
     let worktree = git
         .worktree_state(path)
         .map_err(failed("worktree status lookup failed"))?;
-    let operation = git
-        .operation_state(path)
-        .map_err(failed("Git operation lookup failed"))?;
-    let pull_requests = match &branch {
-        CurrentBranch::Attached { name, .. }
-            if scratch_needs_pull_requests(&worktree, &branch, &operation, protected) =>
-        {
-            github
-                .pull_requests(repository, name)
-                .map_err(failed("pull-request lookup failed"))?
-        }
-        _ => PullRequestState::NotChecked,
-    };
     Ok(ScratchObservation {
         worktree,
         branch,
         operation,
-        pull_requests,
+        pull_requests: PullRequestState::NotChecked,
     })
+}
+
+/// Fills pull requests for every observation that needs them, from
+/// `prefetched` when it asked about the observed branch and otherwise from one
+/// more GitHub query. A failed lookup fails each worktree that needed it with
+/// the same error, as if its own lookup had failed.
+fn attach_pull_requests(
+    github: &GitHubAdapter,
+    repository: &Path,
+    observations: &mut [Result<ScratchObservation, PruneOutcome>],
+    protected: &ProtectedBranches,
+    mut prefetched: Prefetched,
+) {
+    let lookup_failed = |error: String| PruneOutcome::Failed {
+        summary: "pull-request lookup failed",
+        error,
+    };
+    let mut missing: Vec<(usize, String)> = Vec::new();
+    for (index, observation) in observations.iter_mut().enumerate() {
+        let Ok(scratch) = observation else { continue };
+        if !scratch_needs_pull_requests(
+            &scratch.worktree,
+            &scratch.branch,
+            &scratch.operation,
+            protected,
+        ) {
+            continue;
+        }
+        let CurrentBranch::Attached { name, .. } = &scratch.branch else {
+            unreachable!("only attached observations need pull requests");
+        };
+        match prefetched.take(name) {
+            Some(Ok(state)) => scratch.pull_requests = state,
+            Some(Err(error)) => *observation = Err(lookup_failed(error)),
+            None => missing.push((index, name.clone())),
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let branches: Vec<&str> = missing.iter().map(|(_, name)| name.as_str()).collect();
+    match github.pull_requests_for_branches(repository, &branches) {
+        Ok(states) => {
+            for ((index, _), state) in missing.into_iter().zip(states) {
+                if let Ok(observation) = &mut observations[index] {
+                    observation.pull_requests = state;
+                }
+            }
+        }
+        Err(error) => {
+            for (index, _) in missing {
+                observations[index] = Err(lookup_failed(error.to_string()));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
