@@ -957,24 +957,116 @@ impl GitHubAdapter {
                 cwd: repository.to_path_buf(),
                 source,
             })?;
-        Ok(PullRequestState::Matches(
-            pull_requests
-                .into_iter()
-                .filter(|pull_request| pull_request.head_ref_name == branch)
-                .map(|pull_request| PullRequest {
-                    number: pull_request.number,
-                    lifecycle: match pull_request.state.as_str() {
-                        "MERGED" if pull_request.merged_at.is_some() => {
-                            PullRequestLifecycle::Merged
-                        }
-                        "OPEN" => PullRequestLifecycle::Open,
-                        _ => PullRequestLifecycle::ClosedUnmerged,
-                    },
-                    head_commit: pull_request.head_ref_oid,
-                })
-                .collect(),
-        ))
+        Ok(pull_request_state(branch, pull_requests))
     }
+
+    /// Looks up the pull requests of many head branches with one
+    /// `gh api graphql` call per `MAX_BRANCHES_PER_QUERY` branches, because
+    /// each `gh` start costs a process, Git calls to resolve the repository,
+    /// and a network round trip. Each alias asks what
+    /// `gh pr list --state all --head <branch> --limit 100` asks: any author,
+    /// newest 100 first. `{owner}` and `{repo}` resolve the repository the same
+    /// way `gh pr list` does, including `gh repo set-default`. Results keep the
+    /// order of `branches`.
+    pub fn pull_requests_for_branches(
+        &self,
+        repository: &Path,
+        branches: &[&str],
+    ) -> Result<Vec<PullRequestState>, AdapterError> {
+        let mut states = Vec::with_capacity(branches.len());
+        for batch in branches.chunks(MAX_BRANCHES_PER_QUERY) {
+            states.extend(self.pull_request_batch(repository, batch)?);
+        }
+        Ok(states)
+    }
+
+    fn pull_request_batch(
+        &self,
+        repository: &Path,
+        branches: &[&str],
+    ) -> Result<Vec<PullRequestState>, AdapterError> {
+        let mut query = "query($owner: String!, $name: String!".to_owned();
+        let mut selections = String::new();
+        let mut gh = arguments(&["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}"]);
+        for (index, branch) in branches.iter().enumerate() {
+            query.push_str(&format!(", $b{index}: String!"));
+            selections.push_str(&format!(
+                " b{index}: pullRequests(headRefName: $b{index}, states: [OPEN, CLOSED, MERGED], \
+                 first: 100, orderBy: {{field: CREATED_AT, direction: DESC}}) \
+                 {{ nodes {{ number state mergedAt headRefName headRefOid }} }}"
+            ));
+            gh.extend(["-f".to_owned(), format!("b{index}={branch}")]);
+        }
+        query.push_str(&format!(
+            ") {{ repository(owner: $owner, name: $name) {{{selections} }} }}"
+        ));
+        gh.extend(["-f".to_owned(), format!("query={query}")]);
+
+        let output = run_command(repository, "gh", &gh)?;
+        if !output.success {
+            return Err(unexpected_exit("gh api graphql", repository, output));
+        }
+        let invalid = |source| AdapterError::InvalidJson {
+            program: "gh api graphql".to_owned(),
+            cwd: repository.to_path_buf(),
+            source,
+        };
+        let mut response: GraphQlResponse =
+            serde_json::from_str(&output.stdout).map_err(invalid)?;
+        branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                let connection = response
+                    .data
+                    .repository
+                    .remove(&format!("b{index}"))
+                    .ok_or_else(|| {
+                        invalid(serde::de::Error::custom(format!(
+                            "response is missing pull requests for {branch}"
+                        )))
+                    })?;
+                Ok(pull_request_state(branch, connection.nodes))
+            })
+            .collect()
+    }
+}
+
+/// Keeps each GraphQL document small enough for GitHub's limits on query
+/// size and requested nodes (100 per branch).
+const MAX_BRANCHES_PER_QUERY: usize = 50;
+
+fn pull_request_state(branch: &str, pull_requests: Vec<GitHubPullRequest>) -> PullRequestState {
+    PullRequestState::Matches(
+        pull_requests
+            .into_iter()
+            .filter(|pull_request| pull_request.head_ref_name == branch)
+            .map(|pull_request| PullRequest {
+                number: pull_request.number,
+                lifecycle: match pull_request.state.as_str() {
+                    "MERGED" if pull_request.merged_at.is_some() => PullRequestLifecycle::Merged,
+                    "OPEN" => PullRequestLifecycle::Open,
+                    _ => PullRequestLifecycle::ClosedUnmerged,
+                },
+                head_commit: pull_request.head_ref_oid,
+            })
+            .collect(),
+    )
+}
+
+#[derive(Deserialize)]
+struct GraphQlResponse {
+    data: GraphQlData,
+}
+
+#[derive(Deserialize)]
+struct GraphQlData {
+    repository: std::collections::HashMap<String, PullRequestConnection>,
+}
+
+#[derive(Deserialize)]
+struct PullRequestConnection {
+    nodes: Vec<GitHubPullRequest>,
 }
 
 #[derive(Deserialize)]

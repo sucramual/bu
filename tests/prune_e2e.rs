@@ -134,6 +134,28 @@ fn write_executable(path: &Path, source: &str) {
     fs::set_permissions(path, permissions).expect("make fake executable");
 }
 
+/// Answers `gh api graphql -f bN=<branch>...` like GitHub: one aliased
+/// `nodes` list per branch, filled by the fake's `pull_requests <branch>`.
+const GRAPHQL_DISPATCH: &str = r#"printf '{"data":{"repository":{'
+separator=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -f)
+      shift
+      case "$1" in
+        b[0-9]*=*)
+          printf '%s"%s":{"nodes":' "$separator" "${1%%=*}"
+          pull_requests "${1#*=}" | tr -d '
+'
+          printf '}'
+          separator=',' ;;
+      esac ;;
+  esac
+  shift
+done
+printf '}}}
+'"#;
+
 /// Fake `gh`: every branch has one merged pull request at its local tip unless a
 /// branch-specific case below says otherwise.
 fn fake_gh(temporary: &TempDir) -> PathBuf {
@@ -143,14 +165,8 @@ fn fake_gh(temporary: &TempDir) -> PathBuf {
         &bin.join("gh"),
         &format!(
             r#"#!/bin/sh
-head=''
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--head" ]; then
-    shift
-    head="$1"
-  fi
-  shift
-done
+pull_requests() {{
+head="$1"
 oid=$(git rev-parse --verify --quiet "refs/heads/$head")
 case "$head" in
   scratch/none)
@@ -167,7 +183,9 @@ case "$head" in
     printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"someone/else","headRefOid":"%s"}}]\n' "$oid" ;;
   *)
     printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "$oid" ;;
-esac"#
+esac
+}}
+{GRAPHQL_DISPATCH}"#
         ),
     );
     bin
@@ -678,11 +696,14 @@ count_file='{counter}'
 count=$(cat "$count_file" 2>/dev/null || printf 0)
 printf '%s' "$((count + 1))" > "$count_file"
 oid=$(git rev-parse refs/heads/scratch/raced)
+pull_requests() {{
 if [ "$count" -eq 0 ]; then
   printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"scratch/raced","headRefOid":"%s"}}]\n' "$oid"
 else
   printf '[{{"number":42,"state":"OPEN","mergedAt":null,"headRefName":"scratch/raced","headRefOid":"%s"}}]\n' "$oid"
-fi"#,
+fi
+}}
+{GRAPHQL_DISPATCH}"#,
             counter = counter.display(),
         ),
     );
@@ -699,6 +720,76 @@ fi"#,
     assert_eq!(fs::read_to_string(&counter).expect("gh count"), "2");
     assert!(scratch.exists());
     assert!(ref_exists(&repository, "refs/heads/scratch/raced"));
+}
+
+#[test]
+fn prune_dry_run_looks_up_every_branch_in_one_github_call() {
+    let (temporary, repository) = prune_fixture();
+    add_scratch(&repository, "done", "scratch/done");
+    add_scratch(&repository, "open", "scratch/open");
+    add_scratch(&repository, "closed", "scratch/closed");
+    let dirty = add_scratch(&repository, "dirty", "scratch/dirty");
+    fs::write(dirty.join("new.txt"), "untracked\n").expect("untracked file");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fs::rename(fake_bin.join("gh"), fake_bin.join("gh-answers")).expect("move fake gh");
+    let counter = temporary.path().join("gh-count");
+    write_executable(
+        &fake_bin.join("gh"),
+        &format!(
+            "#!/bin/sh\nprintf x >> '{}'\nexec '{}' \"$@\"\n",
+            counter.display(),
+            fake_bin.join("gh-answers").display()
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &["--dry-run"]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    for row in [
+        "▎ prunable scratch-done scratch/done merged pull request #42; would remove worktree and branch\n",
+        "▎ skipped  scratch-open scratch/open pull request #7 is open\n",
+        "▎ skipped  scratch-closed scratch/closed pull request #8 was closed without merging\n",
+        "▎ blocked  scratch-dirty scratch/dirty dirty worktree (1 file)\n",
+    ] {
+        assert!(stdout.contains(row), "missing {row:?} in:\n{stdout}");
+    }
+    assert_eq!(fs::read_to_string(&counter).expect("gh count"), "x");
+}
+
+#[test]
+fn prune_fails_only_the_worktrees_whose_batched_pull_request_lookup_failed() {
+    let (temporary, repository) = prune_fixture();
+    let first = add_scratch(&repository, "first", "scratch/first");
+    let second = add_scratch(&repository, "second", "scratch/second");
+    let dirty = add_scratch(&repository, "dirty", "scratch/dirty");
+    fs::write(dirty.join("new.txt"), "untracked\n").expect("untracked file");
+    let config = write_repository_config(&temporary, &repository);
+    let bin = temporary.path().join("bin");
+    fs::create_dir(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\necho 'GraphQL: API rate limit exceeded' >&2\nexit 1\n",
+    );
+
+    let output = prune(&config, &bin, &[]);
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let stdout = stdout(&output);
+    for row in [
+        "▎ failed   scratch-first scratch/first pull-request lookup failed\n",
+        "▎ failed   scratch-second scratch/second pull-request lookup failed\n",
+        "▎ blocked  scratch-dirty scratch/dirty dirty worktree (1 file)\n",
+    ] {
+        assert!(stdout.contains(row), "missing {row:?} in:\n{stdout}");
+    }
+    assert_eq!(
+        stdout.matches("API rate limit exceeded").count(),
+        2,
+        "{stdout}"
+    );
+    assert!(first.exists() && second.exists() && dirty.exists());
 }
 
 #[test]

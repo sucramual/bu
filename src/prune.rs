@@ -235,13 +235,13 @@ pub fn prune(
     }
 }
 
-/// Caps concurrent observations so one prune run does not flood `gh` and
-/// GitHub with parallel requests.
+/// Caps concurrent Git observations so one prune run does not start an
+/// unbounded number of `git status` processes.
 const MAX_OBSERVATION_THREADS: usize = 8;
 
-/// Observes and classifies scratch worktrees in parallel, because each one
-/// waits on several Git commands and a GitHub lookup. Outcomes keep the order
-/// of `paths`.
+/// Observes scratch worktrees in parallel, because each one waits on Git
+/// commands, then looks up every needed branch in one batched GitHub query.
+/// Outcomes keep the order of `paths`.
 fn classify_concurrently(
     git: &GitAdapter,
     github: &GitHubAdapter,
@@ -250,14 +250,14 @@ fn classify_concurrently(
     protected: &ProtectedBranches,
 ) -> Vec<PruneOutcome> {
     let chunk_size = paths.len().div_ceil(MAX_OBSERVATION_THREADS).max(1);
-    thread::scope(|scope| {
+    let mut observations: Vec<_> = thread::scope(|scope| {
         let workers: Vec<_> = paths
             .chunks(chunk_size)
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|path| classify_scratch(git, github, repository, path, protected))
+                        .map(|path| observe_scratch_git(git, path))
                         .collect::<Vec<_>>()
                 })
             })
@@ -270,25 +270,20 @@ fn classify_concurrently(
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
             .collect()
-    })
-}
-
-fn classify_scratch(
-    git: &GitAdapter,
-    github: &GitHubAdapter,
-    repository: &Path,
-    path: &Path,
-    protected: &ProtectedBranches,
-) -> PruneOutcome {
-    match observe_scratch(git, github, repository, path, protected) {
-        Err(failure) => failure,
-        Ok(observation) => match decide_scratch(&observation, protected) {
-            ScratchDecision::Prunable { pull_request, .. } => {
-                PruneOutcome::Prunable { pull_request }
-            }
-            ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
-        },
-    }
+    });
+    attach_pull_requests(github, repository, &mut observations, protected);
+    observations
+        .into_iter()
+        .map(|observation| match observation {
+            Err(failure) => failure,
+            Ok(observation) => match decide_scratch(&observation, protected) {
+                ScratchDecision::Prunable { pull_request, .. } => {
+                    PruneOutcome::Prunable { pull_request }
+                }
+                ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
+            },
+        })
+        .collect()
 }
 
 fn clean_stale_metadata(
@@ -426,6 +421,15 @@ fn observe_scratch(
     path: &Path,
     protected: &ProtectedBranches,
 ) -> Result<ScratchObservation, PruneOutcome> {
+    let mut observations = [observe_scratch_git(git, path)];
+    attach_pull_requests(github, repository, &mut observations, protected);
+    let [observation] = observations;
+    observation
+}
+
+/// Reads everything but the pull requests, which stay `NotChecked` until
+/// `attach_pull_requests` fills them.
+fn observe_scratch_git(git: &GitAdapter, path: &Path) -> Result<ScratchObservation, PruneOutcome> {
     let failed = |summary: &'static str| {
         move |error: crate::error::AdapterError| PruneOutcome::Failed {
             summary,
@@ -451,22 +455,68 @@ fn observe_scratch(
     let worktree = git
         .worktree_state(path)
         .map_err(failed("worktree status lookup failed"))?;
-    let pull_requests = match &branch {
-        CurrentBranch::Attached { name, .. }
-            if scratch_needs_pull_requests(&worktree, &branch, &operation, protected) =>
-        {
-            github
-                .pull_requests(repository, name)
-                .map_err(failed("pull-request lookup failed"))?
-        }
-        _ => PullRequestState::NotChecked,
-    };
     Ok(ScratchObservation {
         worktree,
         branch,
         operation,
-        pull_requests,
+        pull_requests: PullRequestState::NotChecked,
     })
+}
+
+/// Looks up pull requests for every observation that needs them in one
+/// GitHub query. If the query fails, each of those worktrees fails with the
+/// same error, as if its own lookup had failed.
+fn attach_pull_requests(
+    github: &GitHubAdapter,
+    repository: &Path,
+    observations: &mut [Result<ScratchObservation, PruneOutcome>],
+    protected: &ProtectedBranches,
+) {
+    let needed: Vec<usize> = observations
+        .iter()
+        .enumerate()
+        .filter(|(_, observation)| {
+            observation.as_ref().is_ok_and(|observation| {
+                scratch_needs_pull_requests(
+                    &observation.worktree,
+                    &observation.branch,
+                    &observation.operation,
+                    protected,
+                )
+            })
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if needed.is_empty() {
+        return;
+    }
+    let branches: Vec<&str> = needed
+        .iter()
+        .map(|&index| match &observations[index] {
+            Ok(ScratchObservation {
+                branch: CurrentBranch::Attached { name, .. },
+                ..
+            }) => name.as_str(),
+            _ => unreachable!("only attached observations need pull requests"),
+        })
+        .collect();
+    match github.pull_requests_for_branches(repository, &branches) {
+        Ok(states) => {
+            for (index, state) in needed.into_iter().zip(states) {
+                if let Ok(observation) = &mut observations[index] {
+                    observation.pull_requests = state;
+                }
+            }
+        }
+        Err(error) => {
+            for index in needed {
+                observations[index] = Err(PruneOutcome::Failed {
+                    summary: "pull-request lookup failed",
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
