@@ -58,7 +58,7 @@ pub enum OperationState {
     InProgress(Vec<GitOperation>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitOperation {
     Merge,
     Rebase,

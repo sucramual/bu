@@ -432,8 +432,8 @@ fn observe_scratch(
             error: error.to_string(),
         }
     };
-    let toplevel = git
-        .toplevel(path)
+    let (toplevel, operation) = git
+        .toplevel_and_operation_state(path)
         .map_err(failed("worktree root check failed"))?;
     if toplevel != canonical(path) {
         return Err(PruneOutcome::Failed {
@@ -450,9 +450,6 @@ fn observe_scratch(
     let worktree = git
         .worktree_state(path)
         .map_err(failed("worktree status lookup failed"))?;
-    let operation = git
-        .operation_state(path)
-        .map_err(failed("Git operation lookup failed"))?;
     let pull_requests = match &branch {
         CurrentBranch::Attached { name, .. }
             if scratch_needs_pull_requests(&worktree, &branch, &operation, protected) =>
