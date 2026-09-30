@@ -199,7 +199,7 @@ impl ProtectedBranches {
         }
     }
 
-    fn protection(&self, branch: &str) -> Option<BranchProtection> {
+    pub(crate) fn protection(&self, branch: &str) -> Option<BranchProtection> {
         if branch == self.main_branch {
             Some(BranchProtection::MainBranch)
         } else if self

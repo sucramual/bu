@@ -759,6 +759,41 @@ fn prune_dry_run_looks_up_every_branch_in_one_github_call() {
 }
 
 #[test]
+fn prune_looks_up_an_observed_branch_name_that_the_worktree_list_did_not_report() {
+    let (temporary, repository) = prune_fixture();
+    add_scratch(&repository, "done", "scratch/done");
+    add_scratch(&repository, "tagged", "scratch/tagged");
+    git(&repository, &["tag", "scratch/tagged", "scratch/tagged"]);
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fs::rename(fake_bin.join("gh"), fake_bin.join("gh-answers")).expect("move fake gh");
+    let calls = temporary.path().join("gh-calls");
+    write_executable(
+        &fake_bin.join("gh"),
+        &format!(
+            "#!/bin/sh\nfor argument in \"$@\"; do case \"$argument\" in b[0-9]*=*) printf '%s ' \"$argument\" >> '{calls}' ;; esac; done\necho >> '{calls}'\nexec '{}' \"$@\"\n",
+            fake_bin.join("gh-answers").display(),
+            calls = calls.display(),
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &["--dry-run"]);
+
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains(
+            "▎ prunable scratch-done scratch/done merged pull request #42; would remove worktree and branch\n"
+        ),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(&calls).expect("gh calls"),
+        "b0=scratch/done b1=scratch/tagged \nb0=heads/scratch/tagged \n"
+    );
+}
+
+#[test]
 fn prune_fails_only_the_worktrees_whose_batched_pull_request_lookup_failed() {
     let (temporary, repository) = prune_fixture();
     let first = add_scratch(&repository, "first", "scratch/first");

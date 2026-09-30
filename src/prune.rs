@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -161,13 +162,13 @@ pub fn prune(
             (worktree, outcome)
         })
         .collect();
-    let scratch_paths: Vec<&Path> = candidates
+    let scratch: Vec<&GitWorktree> = candidates
         .iter()
         .filter(|(_, outcome)| outcome.is_none())
-        .map(|(worktree, _)| worktree.path.as_path())
+        .map(|(worktree, _)| *worktree)
         .collect();
     let mut classified =
-        classify_concurrently(git, github, repository, &scratch_paths, &protected).into_iter();
+        classify_concurrently(git, github, repository, &scratch, &protected).into_iter();
 
     let mut items = Vec::new();
     let mut stale = Vec::new();
@@ -240,38 +241,57 @@ pub fn prune(
 const MAX_OBSERVATION_THREADS: usize = 8;
 
 /// Observes scratch worktrees in parallel, because each one waits on Git
-/// commands, then looks up every needed branch in one batched GitHub query.
-/// Outcomes keep the order of `paths`.
+/// commands. Meanwhile one more thread asks GitHub about every unprotected
+/// branch that `git worktree list` reported, so the lookup overlaps the Git
+/// work instead of following it. Outcomes keep the order of `scratch`.
 fn classify_concurrently(
     git: &GitAdapter,
     github: &GitHubAdapter,
     repository: &Path,
-    paths: &[&Path],
+    scratch: &[&GitWorktree],
     protected: &ProtectedBranches,
 ) -> Vec<PruneOutcome> {
-    let chunk_size = paths.len().div_ceil(MAX_OBSERVATION_THREADS).max(1);
-    let mut observations: Vec<_> = thread::scope(|scope| {
-        let workers: Vec<_> = paths
+    let listed_branches: Vec<&str> = scratch
+        .iter()
+        .filter_map(|worktree| worktree.branch.as_deref())
+        .filter(|branch| protected.protection(branch).is_none())
+        .collect();
+    let chunk_size = scratch.len().div_ceil(MAX_OBSERVATION_THREADS).max(1);
+    let (mut observations, prefetched): (Vec<_>, _) = thread::scope(|scope| {
+        let lookup = (!listed_branches.is_empty()).then(|| {
+            scope.spawn(|| github.pull_requests_for_branches(repository, &listed_branches))
+        });
+        let workers: Vec<_> = scratch
             .chunks(chunk_size)
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|path| observe_scratch_git(git, path))
+                        .map(|worktree| observe_scratch_git(git, &worktree.path))
                         .collect::<Vec<_>>()
                 })
             })
             .collect();
-        workers
+        let observations = workers
             .into_iter()
             .flat_map(|worker| {
                 worker
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             })
-            .collect()
+            .collect();
+        let prefetched = lookup.map(|lookup| {
+            lookup
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        (observations, prefetched)
     });
-    attach_pull_requests(github, repository, &mut observations, protected);
+    let prefetched = match prefetched {
+        None => Prefetched::default(),
+        Some(result) => Prefetched::new(&listed_branches, result),
+    };
+    attach_pull_requests(github, repository, &mut observations, protected, prefetched);
     observations
         .into_iter()
         .map(|observation| match observation {
@@ -284,6 +304,50 @@ fn classify_concurrently(
             },
         })
         .collect()
+}
+
+/// Pull requests fetched before the Git observations finished, keyed by
+/// branch name, or the error that fetch hit for those branches.
+#[derive(Default)]
+struct Prefetched {
+    states: HashMap<String, PullRequestState>,
+    failure: Option<(HashSet<String>, String)>,
+}
+
+impl Prefetched {
+    fn new(
+        branches: &[&str],
+        result: Result<Vec<PullRequestState>, crate::error::AdapterError>,
+    ) -> Self {
+        match result {
+            Ok(states) => Self {
+                states: branches
+                    .iter()
+                    .map(|branch| (*branch).to_owned())
+                    .zip(states)
+                    .collect(),
+                failure: None,
+            },
+            Err(error) => Self {
+                states: HashMap::new(),
+                failure: Some((
+                    branches.iter().map(|branch| (*branch).to_owned()).collect(),
+                    error.to_string(),
+                )),
+            },
+        }
+    }
+
+    /// Takes the answer for `branch`, if the prefetch asked about it.
+    fn take(&mut self, branch: &str) -> Option<Result<PullRequestState, String>> {
+        if let Some(state) = self.states.remove(branch) {
+            return Some(Ok(state));
+        }
+        match &self.failure {
+            Some((branches, error)) if branches.contains(branch) => Some(Err(error.clone())),
+            _ => None,
+        }
+    }
 }
 
 fn clean_stale_metadata(
@@ -422,7 +486,13 @@ fn observe_scratch(
     protected: &ProtectedBranches,
 ) -> Result<ScratchObservation, PruneOutcome> {
     let mut observations = [observe_scratch_git(git, path)];
-    attach_pull_requests(github, repository, &mut observations, protected);
+    attach_pull_requests(
+        github,
+        repository,
+        &mut observations,
+        protected,
+        Prefetched::default(),
+    );
     let [observation] = observations;
     observation
 }
@@ -463,57 +533,56 @@ fn observe_scratch_git(git: &GitAdapter, path: &Path) -> Result<ScratchObservati
     })
 }
 
-/// Looks up pull requests for every observation that needs them in one
-/// GitHub query. If the query fails, each of those worktrees fails with the
-/// same error, as if its own lookup had failed.
+/// Fills pull requests for every observation that needs them, from
+/// `prefetched` when it asked about the observed branch and otherwise from one
+/// more GitHub query. A failed lookup fails each worktree that needed it with
+/// the same error, as if its own lookup had failed.
 fn attach_pull_requests(
     github: &GitHubAdapter,
     repository: &Path,
     observations: &mut [Result<ScratchObservation, PruneOutcome>],
     protected: &ProtectedBranches,
+    mut prefetched: Prefetched,
 ) {
-    let needed: Vec<usize> = observations
-        .iter()
-        .enumerate()
-        .filter(|(_, observation)| {
-            observation.as_ref().is_ok_and(|observation| {
-                scratch_needs_pull_requests(
-                    &observation.worktree,
-                    &observation.branch,
-                    &observation.operation,
-                    protected,
-                )
-            })
-        })
-        .map(|(index, _)| index)
-        .collect();
-    if needed.is_empty() {
+    let lookup_failed = |error: String| PruneOutcome::Failed {
+        summary: "pull-request lookup failed",
+        error,
+    };
+    let mut missing: Vec<(usize, String)> = Vec::new();
+    for (index, observation) in observations.iter_mut().enumerate() {
+        let Ok(scratch) = observation else { continue };
+        if !scratch_needs_pull_requests(
+            &scratch.worktree,
+            &scratch.branch,
+            &scratch.operation,
+            protected,
+        ) {
+            continue;
+        }
+        let CurrentBranch::Attached { name, .. } = &scratch.branch else {
+            unreachable!("only attached observations need pull requests");
+        };
+        match prefetched.take(name) {
+            Some(Ok(state)) => scratch.pull_requests = state,
+            Some(Err(error)) => *observation = Err(lookup_failed(error)),
+            None => missing.push((index, name.clone())),
+        }
+    }
+    if missing.is_empty() {
         return;
     }
-    let branches: Vec<&str> = needed
-        .iter()
-        .map(|&index| match &observations[index] {
-            Ok(ScratchObservation {
-                branch: CurrentBranch::Attached { name, .. },
-                ..
-            }) => name.as_str(),
-            _ => unreachable!("only attached observations need pull requests"),
-        })
-        .collect();
+    let branches: Vec<&str> = missing.iter().map(|(_, name)| name.as_str()).collect();
     match github.pull_requests_for_branches(repository, &branches) {
         Ok(states) => {
-            for (index, state) in needed.into_iter().zip(states) {
+            for ((index, _), state) in missing.into_iter().zip(states) {
                 if let Ok(observation) = &mut observations[index] {
                     observation.pull_requests = state;
                 }
             }
         }
         Err(error) => {
-            for index in needed {
-                observations[index] = Err(PruneOutcome::Failed {
-                    summary: "pull-request lookup failed",
-                    error: error.to_string(),
-                });
+            for (index, _) in missing {
+                observations[index] = Err(lookup_failed(error.to_string()));
             }
         }
     }
