@@ -1,12 +1,14 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::adapters::{GitAdapter, GitHubAdapter, GitWorktree};
+use crate::adapters::{CwdProcess, GitAdapter, GitHubAdapter, GitWorktree, ProcessAdapter};
 use crate::domain::{
     BranchProtection, Config, CurrentBranch, ProtectedBranches, PruneSkipReason, PullRequestState,
     ScratchDecision, ScratchObservation, decide_scratch, scratch_needs_pull_requests,
 };
+use crate::error::AdapterError;
 use crate::report::{
     CYAN, DIM_GRAY, GREEN, RED, RowStyle, YELLOW, branch_name, format_operations, unique_labels,
     write_dirty_files, write_marker_row,
@@ -15,8 +17,15 @@ use crate::report::{
 #[derive(Debug)]
 pub struct PruneReport {
     pub dry_run: bool,
-    pub listing_failure: Option<String>,
+    pub run_failure: Option<RunFailure>,
     pub items: Vec<PruneItem>,
+}
+
+/// A failed repository-wide inspection. No worktree is classified or changed.
+#[derive(Debug)]
+pub struct RunFailure {
+    pub summary: &'static str,
+    pub error: String,
 }
 
 #[derive(Debug)]
@@ -60,7 +69,7 @@ pub struct PruneFormat {
 
 impl PruneReport {
     pub fn has_failures(&self) -> bool {
-        self.listing_failure.is_some()
+        self.run_failure.is_some()
             || self
                 .items
                 .iter()
@@ -121,17 +130,32 @@ pub fn prune(
     config: &Config,
     git: &GitAdapter,
     github: &GitHubAdapter,
+    processes: &ProcessAdapter,
     dry_run: bool,
 ) -> PruneReport {
     let repository = &config.repository.path;
+    let run_failure = |summary, error| PruneReport {
+        dry_run,
+        run_failure: Some(RunFailure { summary, error }),
+        items: Vec::new(),
+    };
     let worktrees = match git.worktrees(repository) {
         Ok(worktrees) => worktrees,
         Err(error) => {
-            return PruneReport {
-                dry_run,
-                listing_failure: Some(format!("could not list worktrees: {error}")),
-                items: Vec::new(),
-            };
+            return run_failure(
+                "worktree listing failed",
+                format!("could not list worktrees: {error}"),
+            );
+        }
+    };
+    // Without a process list, every worktree might be in use, so nothing is safe.
+    let live = match live_processes(processes, repository) {
+        Ok(live) => live,
+        Err(error) => {
+            return run_failure(
+                "process check failed",
+                format!("could not list process directories: {error}"),
+            );
         }
     };
     let excluded = ExcludedWorktrees::new(config, &worktrees);
@@ -160,6 +184,8 @@ pub fn prune(
             .is_some_and(|directory| directory.starts_with(canonical(&worktree.path)))
         {
             PruneOutcome::Skipped(PruneSkipReason::ContainsCurrentDirectory)
+        } else if let Some(reason) = in_use(&worktree.path, &live) {
+            PruneOutcome::Skipped(reason)
         } else {
             match observe_scratch(git, github, repository, &worktree.path, &protected) {
                 Err(failure) => failure,
@@ -208,6 +234,7 @@ pub fn prune(
             item.outcome = remove_scratch(
                 git,
                 github,
+                processes,
                 repository,
                 &item.path,
                 &protected,
@@ -218,9 +245,49 @@ pub fn prune(
 
     PruneReport {
         dry_run,
-        listing_failure: None,
+        run_failure: None,
         items,
     }
+}
+
+/// Lists every process except `bu` itself, with canonical directories so that
+/// `/tmp` and `/private/tmp` compare equal.
+fn live_processes(
+    processes: &ProcessAdapter,
+    repository: &Path,
+) -> Result<Vec<CwdProcess>, AdapterError> {
+    let own_pid = std::process::id();
+    Ok(processes
+        .cwd_processes(repository)?
+        .into_iter()
+        .filter(|process| process.pid != own_pid)
+        .map(|process| CwdProcess {
+            cwd: canonical(&process.cwd),
+            ..process
+        })
+        .collect())
+}
+
+/// `Path::starts_with` compares whole components, so `/a/wt` never matches a
+/// process in `/a/wt-2`.
+fn in_use(path: &Path, live: &[CwdProcess]) -> Option<PruneSkipReason> {
+    let path = canonical(path);
+    let users: Vec<_> = live
+        .iter()
+        .filter(|process| process.cwd.starts_with(&path))
+        .collect();
+    if users.is_empty() {
+        return None;
+    }
+    let pids: BTreeSet<_> = users.iter().map(|process| process.pid).collect();
+    let commands: BTreeSet<_> = users
+        .iter()
+        .map(|process| process.command.clone())
+        .collect();
+    Some(PruneSkipReason::InUse {
+        processes: pids.len(),
+        commands: commands.into_iter().collect(),
+    })
 }
 
 fn clean_stale_metadata(
@@ -266,6 +333,7 @@ fn clean_stale_metadata(
 fn remove_scratch(
     git: &GitAdapter,
     github: &GitHubAdapter,
+    processes: &ProcessAdapter,
     repository: &Path,
     path: &Path,
     protected: &ProtectedBranches,
@@ -311,6 +379,20 @@ fn remove_scratch(
         } => (branch, commit, pull_request),
         ScratchDecision::Skip(reason) => return PruneOutcome::Skipped(reason),
     };
+    // Checked last because a process can start while the GitHub lookup runs.
+    match live_processes(processes, repository) {
+        Ok(live) => {
+            if let Some(reason) = in_use(path, &live) {
+                return PruneOutcome::Skipped(reason);
+            }
+        }
+        Err(error) => {
+            return PruneOutcome::Failed {
+                summary: "pre-removal recheck failed",
+                error: format!("process check failed: {error}"),
+            };
+        }
+    }
 
     if let Err(error) = git.remove_worktree(repository, path) {
         return PruneOutcome::Failed {
@@ -441,14 +523,14 @@ pub fn format_prune_report(report: &PruneReport, format: PruneFormat) -> String 
     let labels = unique_labels(&paths);
     let mut counts = Counts::default();
 
-    if let Some(error) = &report.listing_failure {
+    if let Some(RunFailure { summary, error }) = &report.run_failure {
         counts.failed += 1;
         write_marker_row(
             &mut formatted,
             Role::Failed.style(),
             "repository",
             "unknown",
-            "worktree listing failed",
+            summary,
             format.use_color,
         );
         let _ = writeln!(formatted, "    error: {error}");
@@ -614,6 +696,23 @@ fn describe_skip(reason: &PruneSkipReason) -> (Role, String) {
             Role::Blocked,
             "current directory is inside this worktree".to_owned(),
         ),
+        PruneSkipReason::InUse {
+            processes,
+            commands,
+        } => {
+            let process_word = if *processes == 1 {
+                "process"
+            } else {
+                "processes"
+            };
+            (
+                Role::Blocked,
+                format!(
+                    "in use by {processes} {process_word} ({})",
+                    commands.join(", ")
+                ),
+            )
+        }
         PruneSkipReason::OperationInProgress(operations) => {
             (Role::Blocked, format_operations(operations))
         }

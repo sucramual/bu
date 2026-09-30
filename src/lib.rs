@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use adapters::{GitAdapter, GitHubAdapter};
+use adapters::{GitAdapter, GitHubAdapter, ProcessAdapter};
 pub use domain::Config;
 use domain::{BenchConfig, RepositoryConfig};
 pub use error::AppError;
@@ -256,7 +256,8 @@ pub fn run_recycle(config: &Config, force: bool) -> RunReport {
 pub fn run_prune(config: &Config, dry_run: bool) -> PruneReport {
     let git = GitAdapter::new();
     let github = GitHubAdapter::new();
-    prune::prune(config, &git, &github, dry_run)
+    let processes = ProcessAdapter::new();
+    prune::prune(config, &git, &github, &processes, dry_run)
 }
 
 fn default_config_path() -> Result<PathBuf, AppError> {
