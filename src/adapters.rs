@@ -729,8 +729,8 @@ fn is_status_code(status: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        OPERATION_MARKERS, operation_state_from, parse_rev_parse_lines, parse_worktree_state,
-        parse_worktrees,
+        OPERATION_MARKERS, operation_state_from, parse_cwd_processes, parse_rev_parse_lines,
+        parse_worktree_state, parse_worktrees,
     };
     use crate::domain::{CurrentBranch, GitOperation, OperationState, WorktreeState};
     use std::fs;
@@ -917,6 +917,46 @@ mod tests {
 
         assert!(error.to_string().contains("not valid porcelain"));
     }
+
+    #[test]
+    fn parses_one_record_per_process_and_ignores_other_fields() {
+        let processes = parse_cwd_processes(
+            b"p265\nczsh\nfcwd\nn/Users/marcus/work tree\np302\ncGoogle Chrome Helper\nfcwd\nn/\np400\nfcwd\nn/tmp\n",
+        )
+        .expect("valid lsof output");
+
+        assert_eq!(processes.len(), 3);
+        assert_eq!(processes[0].pid, 265);
+        assert_eq!(processes[0].command, "zsh");
+        assert_eq!(processes[0].cwd, Path::new("/Users/marcus/work tree"));
+        assert_eq!(processes[1].command, "Google Chrome Helper");
+        assert_eq!(processes[1].cwd, Path::new("/"));
+        assert_eq!(processes[2].command, "unknown");
+    }
+
+    #[test]
+    fn parses_empty_output_and_processes_without_a_readable_directory() {
+        assert!(parse_cwd_processes(b"").expect("empty output").is_empty());
+        let processes = parse_cwd_processes(b"p1\nclaunchd\np2\ncnode\nfcwd\nn/work\n")
+            .expect("valid lsof output");
+
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 2);
+    }
+
+    #[test]
+    fn rejects_a_file_name_before_any_process_id() {
+        let error = parse_cwd_processes(b"fcwd\nn/work\n").expect_err("orphan file name");
+
+        assert!(error.to_string().contains("before a process id"));
+    }
+
+    #[test]
+    fn rejects_a_process_id_that_is_not_a_number() {
+        let error = parse_cwd_processes(b"pabc\ncnode\nn/work\n").expect_err("invalid pid");
+
+        assert!(error.to_string().contains("not a number"));
+    }
 }
 
 pub struct GitHubAdapter;
@@ -1067,6 +1107,82 @@ struct GraphQlData {
 #[derive(Deserialize)]
 struct PullRequestConnection {
     nodes: Vec<GitHubPullRequest>,
+}
+
+pub struct ProcessAdapter;
+
+/// A running process and its current working directory, as `lsof` reports it.
+#[derive(Debug)]
+pub struct CwdProcess {
+    pub pid: u32,
+    pub command: String,
+    pub cwd: PathBuf,
+}
+
+impl ProcessAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Lists the current directory of every process `lsof` can inspect. It
+    /// never uses `+D`, which walks whole trees such as `node_modules`.
+    pub fn cwd_processes(&self, cwd: &Path) -> Result<Vec<CwdProcess>, AdapterError> {
+        let output = run_command(cwd, "lsof", &arguments(&["-d", "cwd", "-Fpcn"]))?;
+        // lsof exits 1 when it cannot inspect some processes but still prints
+        // the rest; empty output with that status is a real failure.
+        let partial = output.status == "1" && !output.stdout.trim().is_empty();
+        if !output.success && !partial {
+            return Err(unexpected_exit("lsof", cwd, output));
+        }
+
+        parse_cwd_processes(&output.raw_stdout)
+    }
+}
+
+fn parse_cwd_processes(output: &[u8]) -> Result<Vec<CwdProcess>, AdapterError> {
+    let invalid = |message: String| AdapterError::InvalidProcessList { message };
+    let mut processes = Vec::new();
+    let mut current: Option<(u32, Option<String>)> = None;
+    for line in output.split(|byte| *byte == b'\n') {
+        let Some((&field, value)) = line.split_first() else {
+            continue;
+        };
+        match field {
+            b'p' => {
+                let pid = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(|pid| pid.parse().ok())
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "process id {:?} is not a number",
+                            String::from_utf8_lossy(value)
+                        ))
+                    })?;
+                current = Some((pid, None));
+            }
+            b'c' => {
+                let (_, command) = current
+                    .as_mut()
+                    .ok_or_else(|| invalid("command appears before a process id".to_owned()))?;
+                *command = Some(String::from_utf8_lossy(value).into_owned());
+            }
+            b'n' => {
+                let (pid, command) = current
+                    .as_ref()
+                    .ok_or_else(|| invalid("file name appears before a process id".to_owned()))?;
+                if value.is_empty() {
+                    return Err(invalid(format!("process {pid} has an empty file name")));
+                }
+                processes.push(CwdProcess {
+                    pid: *pid,
+                    command: command.clone().unwrap_or_else(|| "unknown".to_owned()),
+                    cwd: path_from_bytes(value),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(processes)
 }
 
 #[derive(Deserialize)]

@@ -243,6 +243,11 @@ pub enum BranchProtection {
 pub enum PruneSkipReason {
     Locked,
     ContainsCurrentDirectory,
+    /// Running processes have their current directory in the worktree.
+    InUse {
+        processes: usize,
+        commands: Vec<String>,
+    },
     OperationInProgress(Vec<GitOperation>),
     DetachedHead,
     ProtectedBranch {

@@ -1,14 +1,17 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use crate::adapters::{GitAdapter, GitHubAdapter, GitWorktree, ScratchHead};
+use crate::adapters::{
+    CwdProcess, GitAdapter, GitHubAdapter, GitWorktree, ProcessAdapter, ScratchHead,
+};
 use crate::domain::{
     BranchProtection, Config, CurrentBranch, ProtectedBranches, PruneSkipReason, PullRequestState,
     ScratchDecision, ScratchObservation, decide_scratch, scratch_needs_pull_requests,
 };
+use crate::error::AdapterError;
 use crate::report::{
     CYAN, DIM_GRAY, GREEN, RED, RowStyle, YELLOW, branch_name, format_operations, unique_labels,
     write_dirty_files, write_marker_row,
@@ -17,8 +20,15 @@ use crate::report::{
 #[derive(Debug)]
 pub struct PruneReport {
     pub dry_run: bool,
-    pub listing_failure: Option<String>,
+    pub run_failure: Option<RunFailure>,
     pub items: Vec<PruneItem>,
+}
+
+/// A failed repository-wide inspection. No worktree is classified or changed.
+#[derive(Debug)]
+pub struct RunFailure {
+    pub summary: &'static str,
+    pub error: String,
 }
 
 #[derive(Debug)]
@@ -62,7 +72,7 @@ pub struct PruneFormat {
 
 impl PruneReport {
     pub fn has_failures(&self) -> bool {
-        self.listing_failure.is_some()
+        self.run_failure.is_some()
             || self
                 .items
                 .iter()
@@ -123,24 +133,29 @@ pub fn prune(
     config: &Config,
     git: &GitAdapter,
     github: &GitHubAdapter,
+    processes: &ProcessAdapter,
     dry_run: bool,
 ) -> PruneReport {
     let repository = &config.repository.path;
+    let run_failure = |summary, error| PruneReport {
+        dry_run,
+        run_failure: Some(RunFailure { summary, error }),
+        items: Vec::new(),
+    };
     let worktrees = match git.worktrees(repository) {
         Ok(worktrees) => worktrees,
         Err(error) => {
-            return PruneReport {
-                dry_run,
-                listing_failure: Some(format!("could not list worktrees: {error}")),
-                items: Vec::new(),
-            };
+            return run_failure(
+                "worktree listing failed",
+                format!("could not list worktrees: {error}"),
+            );
         }
     };
     let excluded = ExcludedWorktrees::new(config, &worktrees);
     let protected = ProtectedBranches::from_config(config);
     let current_directory = std::env::current_dir().ok().map(|path| canonical(&path));
 
-    let candidates: Vec<(&GitWorktree, Option<PruneOutcome>)> = worktrees
+    let mut candidates: Vec<(&GitWorktree, Option<PruneOutcome>)> = worktrees
         .iter()
         .skip(1)
         .filter(|worktree| !worktree.bare && !excluded.contains(&worktree.path))
@@ -162,13 +177,51 @@ pub fn prune(
             (worktree, outcome)
         })
         .collect();
-    let scratch: Vec<&GitWorktree> = candidates
+    // Asks about every branch that passed the cheap checks, including branches
+    // of worktrees the process check blocks next. Their answers go unused.
+    let listed_branches: Vec<&str> = candidates
         .iter()
         .filter(|(_, outcome)| outcome.is_none())
-        .map(|(worktree, _)| *worktree)
+        .filter_map(|(worktree, _)| worktree.branch.as_deref())
+        .filter(|branch| protected.protection(branch).is_none())
         .collect();
-    let mut classified =
-        classify_concurrently(git, github, repository, &scratch, &protected).into_iter();
+    let classified: Result<_, AdapterError> = thread::scope(|scope| {
+        // Started first, so the network round trip overlaps `lsof` and the Git
+        // observations instead of following them.
+        let lookup = (!listed_branches.is_empty()).then(|| {
+            scope.spawn(|| github.pull_requests_for_branches(repository, &listed_branches))
+        });
+        let live = live_processes(processes, repository)?;
+        for (worktree, outcome) in &mut candidates {
+            if outcome.is_none() {
+                *outcome = in_use(&worktree.path, &live).map(PruneOutcome::Skipped);
+            }
+        }
+        let scratch: Vec<&GitWorktree> = candidates
+            .iter()
+            .filter(|(_, outcome)| outcome.is_none())
+            .map(|(worktree, _)| *worktree)
+            .collect();
+        Ok(classify_concurrently(
+            git,
+            github,
+            repository,
+            &scratch,
+            &protected,
+            &listed_branches,
+            lookup,
+        ))
+    });
+    let mut classified = match classified {
+        Ok(classified) => classified.into_iter(),
+        // Without a process list, every worktree might be in use, so nothing is safe.
+        Err(error) => {
+            return run_failure(
+                "process check failed",
+                format!("could not list process directories: {error}"),
+            );
+        }
+    };
 
     let mut items = Vec::new();
     let mut stale = Vec::new();
@@ -221,6 +274,7 @@ pub fn prune(
             item.outcome = remove_scratch(
                 git,
                 github,
+                processes,
                 repository,
                 &item.path,
                 &protected,
@@ -231,7 +285,7 @@ pub fn prune(
 
     PruneReport {
         dry_run,
-        listing_failure: None,
+        run_failure: None,
         items,
     }
 }
@@ -240,27 +294,25 @@ pub fn prune(
 /// unbounded number of `git status` processes.
 const MAX_OBSERVATION_THREADS: usize = 8;
 
+/// The pull-request lookup that `prune` starts before the process check.
+type PrefetchHandle<'scope> =
+    thread::ScopedJoinHandle<'scope, Result<Vec<PullRequestState>, AdapterError>>;
+
 /// Observes scratch worktrees in parallel, because each one waits on Git
-/// commands. Meanwhile one more thread asks GitHub about every unprotected
-/// branch that `git worktree list` reported, so the lookup overlaps the Git
-/// work instead of following it. Outcomes keep the order of `scratch`.
+/// commands. `lookup`, already running on its own thread, asks GitHub about
+/// `listed_branches`, so the lookup overlaps the Git work instead of following
+/// it. Outcomes keep the order of `scratch`.
 fn classify_concurrently(
     git: &GitAdapter,
     github: &GitHubAdapter,
     repository: &Path,
     scratch: &[&GitWorktree],
     protected: &ProtectedBranches,
+    listed_branches: &[&str],
+    lookup: Option<PrefetchHandle<'_>>,
 ) -> Vec<PruneOutcome> {
-    let listed_branches: Vec<&str> = scratch
-        .iter()
-        .filter_map(|worktree| worktree.branch.as_deref())
-        .filter(|branch| protected.protection(branch).is_none())
-        .collect();
     let chunk_size = scratch.len().div_ceil(MAX_OBSERVATION_THREADS).max(1);
     let (mut observations, prefetched): (Vec<_>, _) = thread::scope(|scope| {
-        let lookup = (!listed_branches.is_empty()).then(|| {
-            scope.spawn(|| github.pull_requests_for_branches(repository, &listed_branches))
-        });
         let workers: Vec<_> = scratch
             .chunks(chunk_size)
             .map(|chunk| {
@@ -289,7 +341,7 @@ fn classify_concurrently(
     });
     let prefetched = match prefetched {
         None => Prefetched::default(),
-        Some(result) => Prefetched::new(&listed_branches, result),
+        Some(result) => Prefetched::new(listed_branches, result),
     };
     attach_pull_requests(github, repository, &mut observations, protected, prefetched);
     observations
@@ -315,10 +367,7 @@ struct Prefetched {
 }
 
 impl Prefetched {
-    fn new(
-        branches: &[&str],
-        result: Result<Vec<PullRequestState>, crate::error::AdapterError>,
-    ) -> Self {
+    fn new(branches: &[&str], result: Result<Vec<PullRequestState>, AdapterError>) -> Self {
         match result {
             Ok(states) => Self {
                 states: branches
@@ -348,6 +397,46 @@ impl Prefetched {
             _ => None,
         }
     }
+}
+
+/// Lists every process except `bu` itself, with canonical directories so that
+/// `/tmp` and `/private/tmp` compare equal.
+fn live_processes(
+    processes: &ProcessAdapter,
+    repository: &Path,
+) -> Result<Vec<CwdProcess>, AdapterError> {
+    let own_pid = std::process::id();
+    Ok(processes
+        .cwd_processes(repository)?
+        .into_iter()
+        .filter(|process| process.pid != own_pid)
+        .map(|process| CwdProcess {
+            cwd: canonical(&process.cwd),
+            ..process
+        })
+        .collect())
+}
+
+/// `Path::starts_with` compares whole components, so `/a/wt` never matches a
+/// process in `/a/wt-2`.
+fn in_use(path: &Path, live: &[CwdProcess]) -> Option<PruneSkipReason> {
+    let path = canonical(path);
+    let users: Vec<_> = live
+        .iter()
+        .filter(|process| process.cwd.starts_with(&path))
+        .collect();
+    if users.is_empty() {
+        return None;
+    }
+    let pids: BTreeSet<_> = users.iter().map(|process| process.pid).collect();
+    let commands: BTreeSet<_> = users
+        .iter()
+        .map(|process| process.command.clone())
+        .collect();
+    Some(PruneSkipReason::InUse {
+        processes: pids.len(),
+        commands: commands.into_iter().collect(),
+    })
 }
 
 fn clean_stale_metadata(
@@ -393,6 +482,7 @@ fn clean_stale_metadata(
 fn remove_scratch(
     git: &GitAdapter,
     github: &GitHubAdapter,
+    processes: &ProcessAdapter,
     repository: &Path,
     path: &Path,
     protected: &ProtectedBranches,
@@ -438,6 +528,20 @@ fn remove_scratch(
         } => (branch, commit, pull_request),
         ScratchDecision::Skip(reason) => return PruneOutcome::Skipped(reason),
     };
+    // Checked last because a process can start while the GitHub lookup runs.
+    match live_processes(processes, repository) {
+        Ok(live) => {
+            if let Some(reason) = in_use(path, &live) {
+                return PruneOutcome::Skipped(reason);
+            }
+        }
+        Err(error) => {
+            return PruneOutcome::Failed {
+                summary: "pre-removal recheck failed",
+                error: format!("process check failed: {error}"),
+            };
+        }
+    }
 
     if let Err(error) = git.remove_worktree(repository, path) {
         return PruneOutcome::Failed {
@@ -626,14 +730,14 @@ pub fn format_prune_report(report: &PruneReport, format: PruneFormat) -> String 
     let labels = unique_labels(&paths);
     let mut counts = Counts::default();
 
-    if let Some(error) = &report.listing_failure {
+    if let Some(RunFailure { summary, error }) = &report.run_failure {
         counts.failed += 1;
         write_marker_row(
             &mut formatted,
             Role::Failed.style(),
             "repository",
             "unknown",
-            "worktree listing failed",
+            summary,
             format.use_color,
         );
         let _ = writeln!(formatted, "    error: {error}");
@@ -799,6 +903,23 @@ fn describe_skip(reason: &PruneSkipReason) -> (Role, String) {
             Role::Blocked,
             "current directory is inside this worktree".to_owned(),
         ),
+        PruneSkipReason::InUse {
+            processes,
+            commands,
+        } => {
+            let process_word = if *processes == 1 {
+                "process"
+            } else {
+                "processes"
+            };
+            (
+                Role::Blocked,
+                format!(
+                    "in use by {processes} {process_word} ({})",
+                    commands.join(", ")
+                ),
+            )
+        }
         PruneSkipReason::OperationInProgress(operations) => {
             (Role::Blocked, format_operations(operations))
         }
