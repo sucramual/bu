@@ -792,3 +792,118 @@ fn prune_fails_a_registered_folder_that_git_resolves_to_another_worktree() {
     assert!(ref_exists(&repository, "refs/heads/scratch/nested"));
     assert!(ref_exists(&repository, "refs/heads/home"));
 }
+
+fn branch_config(repository: &Path, branch: &str) -> String {
+    let output = Command::new("git")
+        .args([
+            "config",
+            "--get-regexp",
+            &format!("^branch\\.{}\\.", branch.replace('.', "\\.")),
+        ])
+        .current_dir(repository)
+        .output()
+        .expect("git config should start");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn set_upstream_config(repository: &Path, branch: &str) {
+    git(
+        repository,
+        &["config", &format!("branch.{branch}.remote"), "origin"],
+    );
+    git(
+        repository,
+        &[
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+}
+
+#[test]
+fn prune_removes_the_config_section_of_a_deleted_branch() {
+    let (temporary, repository) = prune_fixture();
+    add_scratch(&repository, "tracked", "scratch/tracked.v1");
+    set_upstream_config(&repository, "scratch/tracked.v1");
+    add_scratch(&repository, "untracked", "scratch/untracked");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains("2 pruned, 0 cleaned, 0 kept, 0 blocked, 0 skipped, 0 failed\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("note:"), "{stdout}");
+    assert!(!ref_exists(&repository, "refs/heads/scratch/tracked.v1"));
+    assert_eq!(branch_config(&repository, "scratch/tracked.v1"), "");
+    assert!(
+        !git(&repository, &["config", "--list", "--local"]).contains("branch.scratch/tracked.v1"),
+        "the empty section header should be removed too"
+    );
+}
+
+#[test]
+fn prune_keeps_the_config_section_of_a_branch_that_moved() {
+    let (temporary, repository) = prune_fixture();
+    add_scratch(&repository, "moved", "scratch/moved");
+    set_upstream_config(&repository, "scratch/moved");
+    let moved_to = git(&repository, &["rev-parse", "main"]);
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_git(
+        &fake_bin,
+        &format!(
+            r#"if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then
+  "{real}" "$@" || exit $?
+  exec "{real}" update-ref refs/heads/scratch/moved '{moved_to}'
+fi"#,
+            real = real_git(),
+            moved_to = moved_to.trim(),
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    assert!(stdout(&output).contains("▎ kept     scratch-moved scratch/moved"));
+    assert_eq!(
+        branch_config(&repository, "scratch/moved"),
+        "branch.scratch/moved.remote origin\nbranch.scratch/moved.merge refs/heads/scratch/moved\n"
+    );
+}
+
+#[test]
+fn prune_notes_a_config_cleanup_failure_without_failing_the_run() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "done", "scratch/done");
+    set_upstream_config(&repository, "scratch/done");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_git(
+        &fake_bin,
+        r#"if [ "$1" = "config" ] && [ "$2" = "--remove-section" ]; then
+  printf 'error: could not lock config file\n' >&2
+  exit 255
+fi"#,
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains(
+            "▎ pruned   scratch-done scratch/done merged pull request #42; removed worktree and branch\n    note: could not remove config section branch.scratch/done: "
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("could not lock config file"), "{stdout}");
+    assert!(stdout.contains("1 pruned, 0 cleaned, 0 kept, 0 blocked, 0 skipped, 0 failed\n"));
+    assert!(!scratch.exists());
+    assert!(!ref_exists(&repository, "refs/heads/scratch/done"));
+}

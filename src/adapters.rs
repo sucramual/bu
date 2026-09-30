@@ -448,6 +448,25 @@ impl GitAdapter {
         }
     }
 
+    /// Removes `branch.<name>.*` settings. Git exits 128 with "no such section"
+    /// when the branch never had any, which counts as success.
+    pub fn remove_branch_config(
+        &self,
+        repository: &Path,
+        branch: &str,
+    ) -> Result<(), AdapterError> {
+        let output = run_command(
+            repository,
+            "git",
+            &arguments(&["config", "--remove-section", &format!("branch.{branch}")]),
+        )?;
+        if output.success || output.status == "128" && output.stderr.contains("no such section") {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git config", repository, output))
+        }
+    }
+
     pub fn prune_worktree_metadata(&self, repository: &Path) -> Result<(), AdapterError> {
         let output = run_command(repository, "git", &arguments(&["worktree", "prune"]))?;
         if output.success {

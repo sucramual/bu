@@ -33,6 +33,7 @@ pub enum PruneOutcome {
     },
     Pruned {
         pull_request: u64,
+        config_note: Option<String>,
     },
     BranchKept {
         pull_request: u64,
@@ -318,7 +319,13 @@ fn remove_scratch(
         };
     }
     match git.delete_branch_if_unchanged(repository, &branch, &commit) {
-        Ok(()) => PruneOutcome::Pruned { pull_request },
+        Ok(()) => PruneOutcome::Pruned {
+            pull_request,
+            config_note: git
+                .remove_branch_config(repository, &branch)
+                .err()
+                .map(|error| format!("could not remove config section branch.{branch}: {error}")),
+        },
         Err(delete_error) => {
             match git.optional_ref_commit(repository, &format!("refs/heads/{branch}")) {
                 Ok(current) if current.as_deref() != Some(commit.as_str()) => {
@@ -464,8 +471,17 @@ pub fn format_prune_report(report: &PruneReport, format: PruneFormat) -> String 
                 write_dirty_files(&mut formatted, files);
             }
         }
-        if let PruneOutcome::Failed { error, .. } = &item.outcome {
-            let _ = writeln!(formatted, "    error: {error}");
+        match &item.outcome {
+            PruneOutcome::Failed { error, .. } => {
+                let _ = writeln!(formatted, "    error: {error}");
+            }
+            PruneOutcome::Pruned {
+                config_note: Some(note),
+                ..
+            } => {
+                let _ = writeln!(formatted, "    note: {note}");
+            }
+            _ => {}
         }
     }
 
@@ -543,7 +559,7 @@ fn describe(outcome: &PruneOutcome) -> (Role, String) {
             Role::Prunable,
             format!("merged pull request #{pull_request}; would remove worktree and branch"),
         ),
-        PruneOutcome::Pruned { pull_request } => (
+        PruneOutcome::Pruned { pull_request, .. } => (
             Role::Pruned,
             format!("merged pull request #{pull_request}; removed worktree and branch"),
         ),
