@@ -28,4 +28,5 @@ Preconditions:
 
 - Row order is part of the output contract. A parallel implementation must print rows in `git worktree list` order.
 - Other sessions change the live repository. Trust only rounds whose two baseline outputs agree.
+- Other sessions also start short-lived processes in worktrees, so an `in use by N processes (…)` suffix can change between runs. The script counts a candidate that differs only in those suffixes as `process_drift_rounds`, not `output_mismatches`. Any other change, including a row label change, is still a mismatch.
 - A failed `gh` call shows as a `failed` row. Check `gh auth status` before blaming the candidate.

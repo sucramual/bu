@@ -96,8 +96,23 @@ time_run() { # binary, output file -> prints seconds
 # live repository mid-run, so a round counts only when both baseline outputs
 # agree; otherwise it is retried, up to two extra attempts.
 same() { [ "$2" = "$4" ] && cmp -s "$1" "$3"; }
+# Other sessions also start short-lived processes (such as `git`) inside
+# worktrees, so an "in use by N processes (...)" suffix can differ between two
+# runs of the same code. Only that suffix is normalized; the row label is not.
+# A round whose candidate differs only there is retried the same way.
+normalize_processes() { sed -E 's/in use by [0-9]+ process(es)? \([^)]*\)/in use by <processes>/g' "$1"; }
+classify() { # baseline file, exit, candidate file, exit -> match | drift | mismatch
+  if same "$@"; then
+    echo match
+  elif [ "$2" = "$4" ] && cmp -s <(normalize_processes "$1") <(normalize_processes "$3"); then
+    echo drift
+  else
+    echo mismatch
+  fi
+}
 mismatches=0
 inconclusive=0
+drift_rounds=0
 : > "$run_dir/times.tsv"
 for round in $(seq 1 "$runs"); do
   for attempt in 1 2 3; do
@@ -105,23 +120,32 @@ for round in $(seq 1 "$runs"); do
     read -r b1_seconds b1_exit < <(time_run "$baseline_bin" "$run_dir/baseline-$tag-a.txt")
     read -r cand_seconds cand_exit < <(time_run "$candidate_bin" "$run_dir/candidate-$tag.txt")
     read -r b2_seconds b2_exit < <(time_run "$baseline_bin" "$run_dir/baseline-$tag-b.txt")
-    if same "$run_dir/baseline-$tag-a.txt" "$b1_exit" "$run_dir/baseline-$tag-b.txt" "$b2_exit"; then
-      break
+    if ! same "$run_dir/baseline-$tag-a.txt" "$b1_exit" "$run_dir/baseline-$tag-b.txt" "$b2_exit"; then
+      echo "round $tag: live repository changed during the round; retrying" >&2
+      continue
     fi
-    echo "round $tag: live repository changed during the round; retrying" >&2
+    verdict=$(classify "$run_dir/baseline-$tag-a.txt" "$b1_exit" "$run_dir/candidate-$tag.txt" "$cand_exit")
+    [ "$verdict" = drift ] || break
+    echo "round $tag: only process lists differ (process drift); retrying" >&2
   done
   base_seconds=$(awk -v a="$b1_seconds" -v b="$b2_seconds" 'BEGIN { printf "%.3f", (a < b) ? a : b }')
   if ! same "$run_dir/baseline-$tag-a.txt" "$b1_exit" "$run_dir/baseline-$tag-b.txt" "$b2_exit"; then
     inconclusive=$((inconclusive + 1))
     continue
   fi
+  # Process-drift rounds are left out of the timings, like inconclusive rounds.
+  if [ "$verdict" = drift ]; then
+    drift_rounds=$((drift_rounds + 1))
+    diff "$run_dir/baseline-$tag-a.txt" "$run_dir/candidate-$tag.txt" > "$run_dir/drift-$tag.txt" || true
+    continue
+  fi
   printf '%s\t%s\t%s\t%s\t%s\n' "$round" "$base_seconds" "$cand_seconds" "$b1_exit" "$cand_exit" >> "$run_dir/times.tsv"
-  if ! same "$run_dir/baseline-$tag-a.txt" "$b1_exit" "$run_dir/candidate-$tag.txt" "$cand_exit"; then
+  if [ "$verdict" = mismatch ]; then
     mismatches=$((mismatches + 1))
     diff "$run_dir/baseline-$tag-a.txt" "$run_dir/candidate-$tag.txt" > "$run_dir/diff-$tag.txt" || true
   fi
 done
-[ -s "$run_dir/times.tsv" ] || { echo "no conclusive rounds; the live repository kept changing" >&2; exit 3; }
+[ -s "$run_dir/times.tsv" ] || { echo "no conclusive rounds; the live repository or its processes kept changing" >&2; exit 3; }
 
 # Count subprocesses in one extra run per binary. Shims log each call and
 # exec the real tool; wall time is noisy on a busy machine, call counts are not.
@@ -160,6 +184,7 @@ speedup=$(awk -v b="$base_median" -v c="$cand_median" 'BEGIN { printf "%.2f", b 
   echo "candidate_calls=git:$cand_git gh:$cand_gh"
   echo "output_mismatches=$mismatches"
   echo "inconclusive_rounds=$inconclusive"
+  echo "process_drift_rounds=$drift_rounds"
   echo "repository_state_changed=$state_changed (informational: other sessions may change it)"
   echo "artifacts=$run_dir"
 } | tee "$run_dir/summary.txt"
