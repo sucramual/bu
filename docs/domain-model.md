@@ -28,6 +28,14 @@ _Code_: `BenchDecision::Forceable`
 **Recycled bench:** A bench checked out on its stand-in branch at fetched `origin/main` while its former feature branch ref remains unchanged.
 _Code_: NEW ENTITY `RecycleOutcome`
 
+**Scratch worktree:** A registered linked worktree of the configured repository that is neither the main checkout nor a configured bench. It holds one throwaway change and has no stand-in branch.
+_Avoid_: temporary bench, bench
+_Code_: `ScratchObservation`
+
+**Prunable worktree:** A scratch worktree whose folder exists and that is unlocked, clean apart from ignored files, and free of any Git operation. It is attached to a branch that is not the main branch or a stand-in branch. That branch has no open pull request and exactly one merged pull request whose head commit equals local `HEAD`. Only `bu prune` removes it, together with its local branch.
+_Avoid_: merged worktree, stale worktree
+_Code_: `ScratchDecision::Prunable`
+
 **Ordinary skip:** A classified ineligible state that leaves the bench unchanged and does not make the process fail.
 _Avoid_: error
 _Code_: NEW ENTITY `SkipReason`
