@@ -5,8 +5,8 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::domain::{
-    CurrentBranch, DirtyFile, GitOperation, OperationState, PullRequest, PullRequestState,
-    StandinState, WorktreeState,
+    CurrentBranch, DirtyFile, GitOperation, OperationState, PullRequest, PullRequestLifecycle,
+    PullRequestState, StandinState, WorktreeState,
 };
 use crate::error::AdapterError;
 
@@ -68,6 +68,8 @@ pub struct GitAdapter;
 pub struct GitWorktree {
     pub path: PathBuf,
     pub branch: Option<String>,
+    pub bare: bool,
+    pub locked: bool,
 }
 
 impl GitAdapter {
@@ -86,6 +88,22 @@ impl GitAdapter {
         }
 
         parse_worktree_state(&output.raw_stdout, bench)
+    }
+
+    pub fn toplevel(&self, worktree: &Path) -> Result<PathBuf, AdapterError> {
+        let output = run_command(
+            worktree,
+            "git",
+            &arguments(&["rev-parse", "--show-toplevel"]),
+        )?;
+        if !output.success {
+            return Err(unexpected_exit("git rev-parse", worktree, output));
+        }
+        let toplevel = PathBuf::from(output.stdout.trim_end_matches('\n'));
+        fs::canonicalize(&toplevel).map_err(|source| AdapterError::FileSystem {
+            path: toplevel,
+            source,
+        })
     }
 
     pub fn same_repository(&self, repository: &Path, bench: &Path) -> Result<bool, AdapterError> {
@@ -391,6 +409,73 @@ impl GitAdapter {
         }
     }
 
+    /// Removes a clean, unlocked linked worktree. Git itself refuses dirty or
+    /// locked worktrees because `--force` is never passed.
+    pub fn remove_worktree(&self, repository: &Path, worktree: &Path) -> Result<(), AdapterError> {
+        let output = run_command(
+            repository,
+            "git",
+            &[
+                "worktree".to_owned(),
+                "remove".to_owned(),
+                worktree.to_string_lossy().into_owned(),
+            ],
+        )?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git worktree remove", repository, output))
+        }
+    }
+
+    /// Deletes a local branch only while it still points at `expected_commit`.
+    pub fn delete_branch_if_unchanged(
+        &self,
+        repository: &Path,
+        branch: &str,
+        expected_commit: &str,
+    ) -> Result<(), AdapterError> {
+        let branch_ref = format!("refs/heads/{branch}");
+        let output = run_command(
+            repository,
+            "git",
+            &arguments(&["update-ref", "-d", &branch_ref, expected_commit]),
+        )?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git update-ref", repository, output))
+        }
+    }
+
+    /// Removes `branch.<name>.*` settings. Git exits 128 with "no such section"
+    /// when the branch never had any, which counts as success.
+    pub fn remove_branch_config(
+        &self,
+        repository: &Path,
+        branch: &str,
+    ) -> Result<(), AdapterError> {
+        let output = run_command(
+            repository,
+            "git",
+            &arguments(&["config", "--remove-section", &format!("branch.{branch}")]),
+        )?;
+        if output.success || output.status == "128" && output.stderr.contains("no such section") {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git config", repository, output))
+        }
+    }
+
+    pub fn prune_worktree_metadata(&self, repository: &Path) -> Result<(), AdapterError> {
+        let output = run_command(repository, "git", &arguments(&["worktree", "prune"]))?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(unexpected_exit("git worktree prune", repository, output))
+        }
+    }
+
     pub fn switch_branch(&self, bench: &Path, branch: &str) -> Result<(), AdapterError> {
         let output = run_command(
             bench,
@@ -437,6 +522,8 @@ fn parse_worktrees(output: &[u8], repository: &Path) -> Result<Vec<GitWorktree>,
     let mut worktrees = Vec::new();
     let mut path = None;
     let mut branch = None;
+    let mut bare = false;
+    let mut locked = false;
     let mut saw_field = false;
     for field in output.split(|byte| *byte == b'\0') {
         if field.is_empty() {
@@ -444,6 +531,8 @@ fn parse_worktrees(output: &[u8], repository: &Path) -> Result<Vec<GitWorktree>,
                 worktrees.push(GitWorktree {
                     path,
                     branch: branch.take(),
+                    bare: std::mem::take(&mut bare),
+                    locked: std::mem::take(&mut locked),
                 });
                 saw_field = false;
             } else if saw_field {
@@ -472,6 +561,10 @@ fn parse_worktrees(output: &[u8], repository: &Path) -> Result<Vec<GitWorktree>,
             path = Some(path_from_bytes(value));
         } else if let Some(value) = field.strip_prefix(b"branch refs/heads/") {
             branch = Some(String::from_utf8_lossy(value).into_owned());
+        } else if field == b"bare" {
+            bare = true;
+        } else if field == b"locked" || field.starts_with(b"locked ") {
+            locked = true;
         }
     }
     Ok(worktrees)
@@ -588,6 +681,22 @@ mod tests {
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].path, Path::new("/repository-01\nscratch"));
         assert_eq!(worktrees[0].branch.as_deref(), Some("feature/newline"));
+        assert!(!worktrees[0].locked);
+    }
+
+    #[test]
+    fn parses_locked_and_bare_worktree_records() {
+        let worktrees = parse_worktrees(
+            b"worktree /repository\0bare\0\0worktree /scratch\0HEAD abc123\0branch refs/heads/scratch\0locked on a removable drive\0\0worktree /plain-lock\0detached\0locked\0\0",
+            Path::new("/repository"),
+        )
+        .expect("valid NUL-delimited worktree list");
+
+        assert_eq!(worktrees.len(), 3);
+        assert!(worktrees[0].bare && !worktrees[0].locked);
+        assert!(!worktrees[1].bare && worktrees[1].locked);
+        assert!(worktrees[2].locked);
+        assert_eq!(worktrees[2].branch, None);
     }
 
     #[test]
@@ -678,7 +787,13 @@ impl GitHubAdapter {
                 .filter(|pull_request| pull_request.head_ref_name == branch)
                 .map(|pull_request| PullRequest {
                     number: pull_request.number,
-                    merged: pull_request.state == "MERGED" && pull_request.merged_at.is_some(),
+                    lifecycle: match pull_request.state.as_str() {
+                        "MERGED" if pull_request.merged_at.is_some() => {
+                            PullRequestLifecycle::Merged
+                        }
+                        "OPEN" => PullRequestLifecycle::Open,
+                        _ => PullRequestLifecycle::ClosedUnmerged,
+                    },
                     head_commit: pull_request.head_ref_oid,
                 })
                 .collect(),

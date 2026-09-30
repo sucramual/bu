@@ -1,6 +1,7 @@
 mod adapters;
 mod domain;
 mod error;
+mod prune;
 mod report;
 
 use std::env;
@@ -12,6 +13,7 @@ use adapters::{GitAdapter, GitHubAdapter};
 pub use domain::Config;
 use domain::{BenchConfig, RepositoryConfig};
 pub use error::AppError;
+pub use prune::{PruneFormat, PruneReport, format_prune_report};
 pub use report::{RunReport, StatusFormat, format_report, format_status_report};
 
 pub fn load_config(path: Option<PathBuf>) -> Result<Config, AppError> {
@@ -249,6 +251,12 @@ pub fn run_recycle(config: &Config, force: bool) -> RunReport {
     let git = GitAdapter::new();
     let github = GitHubAdapter::new();
     report::recycle(config, &git, &github, force)
+}
+
+pub fn run_prune(config: &Config, dry_run: bool) -> PruneReport {
+    let git = GitAdapter::new();
+    let github = GitHubAdapter::new();
+    prune::prune(config, &git, &github, dry_run)
 }
 
 fn default_config_path() -> Result<PathBuf, AppError> {

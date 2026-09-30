@@ -849,19 +849,22 @@ impl StatusRole {
 
     fn ansi(self) -> &'static str {
         match self {
-            Self::Eligible => "\x1b[36m",
-            Self::Forceable => "\x1b[33m",
-            Self::Blocked => "\x1b[33m",
-            Self::Idle => "\x1b[2;90m",
-            Self::Recycled => "\x1b[32m",
-            Self::Skipped => "\x1b[2;90m",
-            Self::Failed => "\x1b[31m",
+            Self::Eligible => CYAN,
+            Self::Forceable | Self::Blocked => YELLOW,
+            Self::Idle | Self::Skipped => DIM_GRAY,
+            Self::Recycled => GREEN,
+            Self::Failed => RED,
         }
     }
 }
 
 fn status_labels(report: &RunReport) -> Vec<String> {
     let paths = report.items.iter().map(item_bench_path).collect::<Vec<_>>();
+    unique_labels(&paths)
+}
+
+/// Labels each path by its basename unless another path shares that basename.
+pub(crate) fn unique_labels(paths: &[String]) -> Vec<String> {
     let basenames = paths
         .iter()
         .map(|path| {
@@ -952,40 +955,78 @@ fn write_status_row(
     reason: &str,
     use_color: bool,
 ) {
+    write_marker_row(
+        formatted,
+        RowStyle {
+            label: role.label(),
+            ansi: role.ansi(),
+        },
+        bench,
+        branch,
+        reason,
+        use_color,
+    );
+}
+
+/// The leading label of a report row and the ANSI style of its marker.
+#[derive(Clone, Copy)]
+pub(crate) struct RowStyle {
+    pub label: &'static str,
+    pub ansi: &'static str,
+}
+
+pub(crate) const CYAN: &str = "\x1b[36m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
+pub(crate) const DIM_GRAY: &str = "\x1b[2;90m";
+pub(crate) const GREEN: &str = "\x1b[32m";
+pub(crate) const RED: &str = "\x1b[31m";
+
+pub(crate) fn write_marker_row(
+    formatted: &mut String,
+    style: RowStyle,
+    name: &str,
+    branch: &str,
+    reason: &str,
+    use_color: bool,
+) {
     let marker = if use_color {
-        format!("{}▎\x1b[0m", role.ansi())
+        format!("{}▎\x1b[0m", style.ansi)
     } else {
         "▎".to_owned()
     };
     let _ = writeln!(
         formatted,
-        "{marker} {:<8} {bench} {branch} {reason}",
-        role.label()
+        "{marker} {:<8} {name} {branch} {reason}",
+        style.label
     );
 }
 
 fn write_status_details(formatted: &mut String, observation: &BenchObservation) {
     let _ = writeln!(formatted, "    path: {}", observation.bench.path.display());
     if let WorktreeState::Dirty { files } = &observation.worktree {
-        for file in files {
-            let path = format_path(&file.path);
-            match &file.original_path {
-                Some(original_path) => {
-                    let _ = writeln!(
-                        formatted,
-                        "    {}{} {} -> {path}",
-                        file.index_status,
-                        file.worktree_status,
-                        format_path(original_path),
-                    );
-                }
-                None => {
-                    let _ = writeln!(
-                        formatted,
-                        "    {}{} {path}",
-                        file.index_status, file.worktree_status,
-                    );
-                }
+        write_dirty_files(formatted, files);
+    }
+}
+
+pub(crate) fn write_dirty_files(formatted: &mut String, files: &[DirtyFile]) {
+    for file in files {
+        let path = format_path(&file.path);
+        match &file.original_path {
+            Some(original_path) => {
+                let _ = writeln!(
+                    formatted,
+                    "    {}{} {} -> {path}",
+                    file.index_status,
+                    file.worktree_status,
+                    format_path(original_path),
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    formatted,
+                    "    {}{} {path}",
+                    file.index_status, file.worktree_status,
+                );
             }
         }
     }
@@ -1006,29 +1047,33 @@ fn dirty_file_path(file: &DirtyFile) -> String {
     }
 }
 
-fn branch_name(branch: &CurrentBranch) -> &str {
+pub(crate) fn branch_name(branch: &CurrentBranch) -> &str {
     match branch {
         CurrentBranch::Attached { name, .. } => name,
         CurrentBranch::Detached => "detached",
     }
 }
 
+pub(crate) fn format_operations(operations: &[crate::domain::GitOperation]) -> String {
+    format!(
+        "Git operation in progress: {}",
+        operations
+            .iter()
+            .map(|operation| match operation {
+                crate::domain::GitOperation::Merge => "merge",
+                crate::domain::GitOperation::Rebase => "rebase",
+                crate::domain::GitOperation::CherryPick => "cherry-pick",
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn format_skip_reason(reason: &SkipReason) -> String {
     match reason {
         SkipReason::DetachedHead => "HEAD is detached".to_owned(),
         SkipReason::AlreadyOnStandin => "already on the stand-in branch".to_owned(),
-        SkipReason::OperationInProgress(operations) => format!(
-            "Git operation in progress: {}",
-            operations
-                .iter()
-                .map(|operation| match operation {
-                    crate::domain::GitOperation::Merge => "merge",
-                    crate::domain::GitOperation::Rebase => "rebase",
-                    crate::domain::GitOperation::CherryPick => "cherry-pick",
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        SkipReason::OperationInProgress(operations) => format_operations(operations),
         SkipReason::StandinMissing => "stand-in branch is missing".to_owned(),
         SkipReason::StandinCheckedOutElsewhere(path) => {
             format!("stand-in branch is checked out at {}", path.display())
