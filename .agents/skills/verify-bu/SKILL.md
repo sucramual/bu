@@ -53,6 +53,7 @@ The script:
 4. Runs `bu --config <copy> prune --dry-run --verbose --color never` from a neutral folder, as baseline → candidate → baseline in each round.
 5. Counts a round only when both baseline outputs agree. It retries a round up to twice when other sessions change the live repository mid-round.
 6. Compares candidate output byte for byte with the baseline, plus the exit code.
+7. Runs each binary once more with `git` and `gh` shims on `PATH` that count every subprocess call. Call counts are deterministic; wall time is not on a busy machine.
 
 The script's exit code is `0` when every conclusive round matched, `1` on a mismatch, and `3` when no round was conclusive.
 
@@ -60,7 +61,8 @@ The script's exit code is `0` when every conclusive round matched, `1` on a mism
 
 Each run writes `$BU_VERIFY_ARTIFACTS/<run-id>/`:
 
-- `summary.txt`: baseline and candidate medians (min of the two baseline runs per round), speedup, mismatch and inconclusive counts.
+- `summary.txt`: baseline and candidate medians (min of the two baseline runs per round), speedup, `git`/`gh` call counts per binary, mismatch and inconclusive counts.
+- `calls-baseline.log`, `calls-candidate.log`: one line per subprocess call.
 - `times.tsv`: round, baseline seconds, candidate seconds, baseline exit, candidate exit.
 - `baseline-*-a.txt`, `baseline-*-b.txt`, `candidate-*.txt`: full outputs.
 - `diff-*.txt`: only present for a real mismatch.
@@ -73,6 +75,7 @@ The script creates no processes that outlive it. It leaves artifacts and the bas
 ## Gotchas
 
 - The live repository is shared with other agent sessions. Outputs drift when someone commits or stages files mid-run. That is why the script runs baseline → candidate → baseline.
+- Wall time for identical code has varied 2× when the load average is high (other sessions, `cargo build`). Check `uptime` and trust call counts plus every-round wins over one median.
 - `gh` latency varies from about 0.5s to 1s per call. Compare medians across at least 3 rounds before calling a change faster.
 - Each round makes about 3 × (number of scratch worktrees) `gh` calls. Keep `--runs` modest to stay far below GitHub's hourly GraphQL limit.
 - `git status` inside each worktree may take Git's optional index lock. It is harmless, but it can briefly contend with another session's Git command in the same worktree.

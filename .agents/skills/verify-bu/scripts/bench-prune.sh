@@ -123,6 +123,24 @@ for round in $(seq 1 "$runs"); do
 done
 [ -s "$run_dir/times.tsv" ] || { echo "no conclusive rounds; the live repository kept changing" >&2; exit 3; }
 
+# Count subprocesses in one extra run per binary. Shims log each call and
+# exec the real tool; wall time is noisy on a busy machine, call counts are not.
+shims="$run_dir/shims"
+mkdir -p "$shims"
+for tool in git gh; do
+  real=$(command -v "$tool")
+  printf '#!/bin/sh\necho %s >> "$BU_VERIFY_CALL_LOG"\nexec %s "$@"\n' "$tool" "$real" > "$shims/$tool"
+  chmod +x "$shims/$tool"
+done
+count_calls() { # binary, label -> prints "git_calls gh_calls"
+  local log="$run_dir/calls-$2.log"
+  : > "$log"
+  BU_VERIFY_CALL_LOG="$log" PATH="$shims:$PATH" "$1" --config "$config" prune --dry-run --color never > /dev/null 2>&1 || true
+  echo "$(grep -cx git "$log") $(grep -cx gh "$log")"
+}
+read -r base_git base_gh < <(count_calls "$baseline_bin" baseline)
+read -r cand_git cand_gh < <(count_calls "$candidate_bin" candidate)
+
 snapshot "$run_dir/state-after.txt"
 state_changed=0
 cmp -s "$run_dir/state-before.txt" "$run_dir/state-after.txt" || state_changed=1
@@ -138,6 +156,8 @@ speedup=$(awk -v b="$base_median" -v c="$cand_median" 'BEGIN { printf "%.2f", b 
   echo "baseline_median_s=$base_median"
   echo "candidate_median_s=$cand_median"
   echo "speedup=${speedup}x"
+  echo "baseline_calls=git:$base_git gh:$base_gh"
+  echo "candidate_calls=git:$cand_git gh:$cand_gh"
   echo "output_mismatches=$mismatches"
   echo "inconclusive_rounds=$inconclusive"
   echo "repository_state_changed=$state_changed (informational: other sessions may change it)"
