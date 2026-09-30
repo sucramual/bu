@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use crate::adapters::{GitAdapter, GitHubAdapter, GitWorktree};
+use crate::adapters::{GitAdapter, GitHubAdapter, GitWorktree, ScratchHead};
 use crate::domain::{
     BranchProtection, Config, CurrentBranch, ProtectedBranches, PruneSkipReason, PullRequestState,
     ScratchDecision, ScratchObservation, decide_scratch, scratch_needs_pull_requests,
@@ -432,8 +432,12 @@ fn observe_scratch(
             error: error.to_string(),
         }
     };
-    let (toplevel, operation) = git
-        .toplevel_and_operation_state(path)
+    let ScratchHead {
+        toplevel,
+        branch,
+        operation,
+    } = git
+        .scratch_head(path)
         .map_err(failed("worktree root check failed"))?;
     if toplevel != canonical(path) {
         return Err(PruneOutcome::Failed {
@@ -444,9 +448,6 @@ fn observe_scratch(
             ),
         });
     }
-    let branch = git
-        .current_branch(path)
-        .map_err(failed("branch lookup failed"))?;
     let worktree = git
         .worktree_state(path)
         .map_err(failed("worktree status lookup failed"))?;
