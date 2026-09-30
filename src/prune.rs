@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::adapters::{GitAdapter, GitHubAdapter, GitWorktree};
 use crate::domain::{
@@ -138,43 +139,54 @@ pub fn prune(
     let protected = ProtectedBranches::from_config(config);
     let current_directory = std::env::current_dir().ok().map(|path| canonical(&path));
 
-    let mut items = Vec::new();
-    let mut stale = Vec::new();
-    let mut prunable = Vec::new();
-    for worktree in worktrees
+    let candidates: Vec<(&GitWorktree, Option<PruneOutcome>)> = worktrees
         .iter()
         .skip(1)
         .filter(|worktree| !worktree.bare && !excluded.contains(&worktree.path))
-    {
-        let branch = worktree
-            .branch
-            .clone()
-            .unwrap_or_else(|| "detached".to_owned());
-        let outcome = if worktree.locked {
-            PruneOutcome::Skipped(PruneSkipReason::Locked)
-        } else if !worktree.path.exists() {
-            stale.push(items.len());
-            PruneOutcome::Stale
-        } else if current_directory
-            .as_deref()
-            .is_some_and(|directory| directory.starts_with(canonical(&worktree.path)))
-        {
-            PruneOutcome::Skipped(PruneSkipReason::ContainsCurrentDirectory)
-        } else {
-            match observe_scratch(git, github, repository, &worktree.path, &protected) {
-                Err(failure) => failure,
-                Ok(observation) => match decide_scratch(&observation, &protected) {
-                    ScratchDecision::Prunable { pull_request, .. } => {
-                        prunable.push(items.len());
-                        PruneOutcome::Prunable { pull_request }
-                    }
-                    ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
-                },
-            }
-        };
+        .map(|worktree| {
+            let outcome = if worktree.locked {
+                Some(PruneOutcome::Skipped(PruneSkipReason::Locked))
+            } else if !worktree.path.exists() {
+                Some(PruneOutcome::Stale)
+            } else if current_directory
+                .as_deref()
+                .is_some_and(|directory| directory.starts_with(canonical(&worktree.path)))
+            {
+                Some(PruneOutcome::Skipped(
+                    PruneSkipReason::ContainsCurrentDirectory,
+                ))
+            } else {
+                None
+            };
+            (worktree, outcome)
+        })
+        .collect();
+    let scratch_paths: Vec<&Path> = candidates
+        .iter()
+        .filter(|(_, outcome)| outcome.is_none())
+        .map(|(worktree, _)| worktree.path.as_path())
+        .collect();
+    let mut classified =
+        classify_concurrently(git, github, repository, &scratch_paths, &protected).into_iter();
+
+    let mut items = Vec::new();
+    let mut stale = Vec::new();
+    let mut prunable = Vec::new();
+    for (worktree, outcome) in candidates {
+        let outcome = outcome
+            .or_else(|| classified.next())
+            .expect("one classification per scratch worktree");
+        match outcome {
+            PruneOutcome::Stale => stale.push(items.len()),
+            PruneOutcome::Prunable { .. } => prunable.push(items.len()),
+            _ => {}
+        }
         items.push(PruneItem {
             path: worktree.path.clone(),
-            branch,
+            branch: worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "detached".to_owned()),
             outcome,
         });
     }
@@ -220,6 +232,62 @@ pub fn prune(
         dry_run,
         listing_failure: None,
         items,
+    }
+}
+
+/// Caps concurrent observations so one prune run does not flood `gh` and
+/// GitHub with parallel requests.
+const MAX_OBSERVATION_THREADS: usize = 8;
+
+/// Observes and classifies scratch worktrees in parallel, because each one
+/// waits on several Git commands and a GitHub lookup. Outcomes keep the order
+/// of `paths`.
+fn classify_concurrently(
+    git: &GitAdapter,
+    github: &GitHubAdapter,
+    repository: &Path,
+    paths: &[&Path],
+    protected: &ProtectedBranches,
+) -> Vec<PruneOutcome> {
+    let chunk_size = paths.len().div_ceil(MAX_OBSERVATION_THREADS).max(1);
+    thread::scope(|scope| {
+        let workers: Vec<_> = paths
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|path| classify_scratch(git, github, repository, path, protected))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
+fn classify_scratch(
+    git: &GitAdapter,
+    github: &GitHubAdapter,
+    repository: &Path,
+    path: &Path,
+    protected: &ProtectedBranches,
+) -> PruneOutcome {
+    match observe_scratch(git, github, repository, path, protected) {
+        Err(failure) => failure,
+        Ok(observation) => match decide_scratch(&observation, protected) {
+            ScratchDecision::Prunable { pull_request, .. } => {
+                PruneOutcome::Prunable { pull_request }
+            }
+            ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
+        },
     }
 }
 
