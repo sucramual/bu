@@ -97,6 +97,44 @@ impl GitAdapter {
         parse_worktree_state(&output.raw_stdout, bench)
     }
 
+    /// Lists ignored, untracked files that match `patterns` (git glob
+    /// pathspecs relative to `worktree`). The pathspecs limit Git's walk, so
+    /// ignored trees such as `node_modules` are not enumerated.
+    pub fn ignored_matching(
+        &self,
+        worktree: &Path,
+        patterns: &[String],
+    ) -> Result<Vec<PathBuf>, AdapterError> {
+        if patterns.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut command = arguments(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+        ]);
+        command.extend(patterns.iter().map(|pattern| {
+            if pattern.starts_with(':') {
+                pattern.clone()
+            } else {
+                format!(":(glob){pattern}")
+            }
+        }));
+        let output = run_command(worktree, "git", &command)?;
+        if !output.success {
+            return Err(unexpected_exit("git ls-files", worktree, output));
+        }
+        Ok(output
+            .raw_stdout
+            .split(|byte| *byte == 0)
+            .filter(|record| !record.is_empty())
+            .map(path_from_bytes)
+            .collect())
+    }
+
     /// Resolves the worktree root, any in-progress operation, and the branch
     /// with its commit in one `rev-parse`, because each Git spawn costs more
     /// than the lookups. `--abbrev-ref=loose` shortens the branch exactly like

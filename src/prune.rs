@@ -153,6 +153,7 @@ pub fn prune(
     };
     let excluded = ExcludedWorktrees::new(config, &worktrees);
     let protected = ProtectedBranches::from_config(config);
+    let keep = config.prune.keep.as_slice();
     let current_directory = std::env::current_dir().ok().map(|path| canonical(&path));
 
     let mut candidates: Vec<(&GitWorktree, Option<PruneOutcome>)> = worktrees
@@ -208,6 +209,7 @@ pub fn prune(
             repository,
             &scratch,
             &protected,
+            keep,
             &listed_branches,
             lookup,
         ))
@@ -278,6 +280,7 @@ pub fn prune(
                 repository,
                 &item.path,
                 &protected,
+                keep,
                 &mut item.branch,
             );
         }
@@ -302,12 +305,14 @@ type PrefetchHandle<'scope> =
 /// commands. `lookup`, already running on its own thread, asks GitHub about
 /// `listed_branches`, so the lookup overlaps the Git work instead of following
 /// it. Outcomes keep the order of `scratch`.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct input of one check; a bundle struct would only rename them
 fn classify_concurrently(
     git: &GitAdapter,
     github: &GitHubAdapter,
     repository: &Path,
     scratch: &[&GitWorktree],
     protected: &ProtectedBranches,
+    keep: &[String],
     listed_branches: &[&str],
     lookup: Option<PrefetchHandle<'_>>,
 ) -> Vec<PruneOutcome> {
@@ -319,7 +324,7 @@ fn classify_concurrently(
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|worktree| observe_scratch_git(git, &worktree.path))
+                        .map(|worktree| observe_scratch_git(git, &worktree.path, keep))
                         .collect::<Vec<_>>()
                 })
             })
@@ -479,6 +484,7 @@ fn clean_stale_metadata(
 
 /// Repeats every check immediately before mutation, then removes the worktree
 /// and compare-and-deletes its branch.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct input of one check; a bundle struct would only rename them
 fn remove_scratch(
     git: &GitAdapter,
     github: &GitHubAdapter,
@@ -486,6 +492,7 @@ fn remove_scratch(
     repository: &Path,
     path: &Path,
     protected: &ProtectedBranches,
+    keep: &[String],
     displayed_branch: &mut String,
 ) -> PruneOutcome {
     match git.worktrees(repository) {
@@ -509,7 +516,7 @@ fn remove_scratch(
             };
         }
     }
-    let observation = match observe_scratch(git, github, repository, path, protected) {
+    let observation = match observe_scratch(git, github, repository, path, protected, keep) {
         Ok(observation) => observation,
         Err(PruneOutcome::Failed { summary, error }) => {
             return PruneOutcome::Failed {
@@ -588,8 +595,9 @@ fn observe_scratch(
     repository: &Path,
     path: &Path,
     protected: &ProtectedBranches,
+    keep: &[String],
 ) -> Result<ScratchObservation, PruneOutcome> {
-    let mut observations = [observe_scratch_git(git, path)];
+    let mut observations = [observe_scratch_git(git, path, keep)];
     attach_pull_requests(
         github,
         repository,
@@ -603,7 +611,11 @@ fn observe_scratch(
 
 /// Reads everything but the pull requests, which stay `NotChecked` until
 /// `attach_pull_requests` fills them.
-fn observe_scratch_git(git: &GitAdapter, path: &Path) -> Result<ScratchObservation, PruneOutcome> {
+fn observe_scratch_git(
+    git: &GitAdapter,
+    path: &Path,
+    keep: &[String],
+) -> Result<ScratchObservation, PruneOutcome> {
     let failed = |summary: &'static str| {
         move |error: crate::error::AdapterError| PruneOutcome::Failed {
             summary,
@@ -629,10 +641,15 @@ fn observe_scratch_git(git: &GitAdapter, path: &Path) -> Result<ScratchObservati
     let worktree = git
         .worktree_state(path)
         .map_err(failed("worktree status lookup failed"))?;
+    // `git status` omits ignored files, and `git worktree remove` deletes them.
+    let kept_ignored = git
+        .ignored_matching(path, keep)
+        .map_err(failed("ignored files lookup failed"))?;
     Ok(ScratchObservation {
         worktree,
         branch,
         operation,
+        kept_ignored,
         pull_requests: PullRequestState::NotChecked,
     })
 }
@@ -756,8 +773,16 @@ pub fn format_prune_report(report: &PruneReport, format: PruneFormat) -> String 
         );
         if format.verbose {
             let _ = writeln!(formatted, "    path: {}", item.path.display());
-            if let PruneOutcome::Skipped(PruneSkipReason::Dirty(files)) = &item.outcome {
-                write_dirty_files(&mut formatted, files);
+            match &item.outcome {
+                PruneOutcome::Skipped(PruneSkipReason::Dirty(files)) => {
+                    write_dirty_files(&mut formatted, files);
+                }
+                PruneOutcome::Skipped(PruneSkipReason::KeptIgnored(files)) => {
+                    for file in files {
+                        let _ = writeln!(formatted, "    kept: {}", file.display());
+                    }
+                }
+                _ => {}
             }
         }
         match &item.outcome {
@@ -943,6 +968,16 @@ fn describe_skip(reason: &PruneSkipReason) -> (Role, String) {
             (
                 Role::Blocked,
                 format!("dirty worktree ({} {file_word})", files.len()),
+            )
+        }
+        PruneSkipReason::KeptIgnored(files) => {
+            let file_word = if files.len() == 1 { "file" } else { "files" };
+            (
+                Role::Blocked,
+                format!(
+                    "ignored files match prune.keep ({} {file_word})",
+                    files.len()
+                ),
             )
         }
         PruneSkipReason::PullRequestNotChecked => {

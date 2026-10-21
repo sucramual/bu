@@ -1330,3 +1330,154 @@ fn prune_blocks_a_worktree_that_a_real_process_uses_as_its_current_directory() {
     assert!(scratch.exists());
     assert!(ref_exists(&repository, "refs/heads/scratch/sleeping"));
 }
+
+/// Ignores `patterns` in every worktree of the repository without a committed change.
+fn ignore_everywhere(repository: &Path, patterns: &str) {
+    let common = git(repository, &["rev-parse", "--git-common-dir"]);
+    let exclude = repository.join(common.trim()).join("info/exclude");
+    fs::create_dir_all(exclude.parent().expect("info directory")).expect("info directory");
+    let mut existing = fs::read_to_string(&exclude).unwrap_or_default();
+    existing.push_str(patterns);
+    fs::write(exclude, existing).expect("exclude file");
+}
+
+fn write_ignored(scratch: &Path, relative: &str) {
+    let path = scratch.join(relative);
+    fs::create_dir_all(path.parent().expect("parent directory")).expect("ignored directory");
+    fs::write(path, "<html>keep me</html>\n").expect("ignored file");
+}
+
+fn add_keep_config(config: &Path, keep: &str) {
+    let mut text = fs::read_to_string(config).expect("config");
+    text.push_str(&format!("\n[prune]\nkeep = [{keep}]\n"));
+    fs::write(config, text).expect("config with keep list");
+}
+
+const KEEP_REASON: &str = "ignored files match prune.keep (1 file)";
+
+/// Bug caught: an ignored `.html` page looked clean to `git status`, so prune
+/// ran `git worktree remove` and deleted it. Before the change the worktree
+/// and branch were removed (`pruned ... removed worktree and branch`).
+#[test]
+fn prune_skips_a_worktree_holding_an_ignored_file_that_a_keep_pattern_matches() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "keep", "scratch/keep");
+    ignore_everywhere(&repository, ".cheese/\n");
+    write_ignored(&scratch, ".cheese/notes/page.html");
+    let config = write_repository_config(&temporary, &repository);
+    add_keep_config(&config, "\".cheese/**\"");
+    let fake_bin = fake_gh(&temporary);
+
+    let dry_run = prune(&config, &fake_bin, &["--dry-run"]);
+    assert_success(&dry_run);
+    let dry_stdout = stdout(&dry_run);
+    assert!(
+        dry_stdout.contains(&format!(
+            "blocked  scratch-keep scratch/keep {KEEP_REASON}\n"
+        )),
+        "{dry_stdout}"
+    );
+    assert!(dry_stdout.contains("0 prunable"), "{dry_stdout}");
+
+    let output = prune(&config, &fake_bin, &["--verbose"]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains(&format!(
+            "blocked  scratch-keep scratch/keep {KEEP_REASON}\n"
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains(".cheese/notes/page.html"), "{stdout}");
+    assert!(stdout.contains("0 pruned"), "{stdout}");
+    assert!(scratch.join(".cheese/notes/page.html").exists());
+    assert!(registered_worktrees(&repository).contains("scratch-keep"));
+    assert!(ref_exists(&repository, "refs/heads/scratch/keep"));
+}
+
+/// Control: without a `[prune]` table the behaviour is unchanged.
+#[test]
+fn prune_still_removes_a_worktree_with_ignored_files_when_no_keep_list_is_configured() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "nokeep", "scratch/nokeep");
+    ignore_everywhere(&repository, ".cheese/\n");
+    write_ignored(&scratch, ".cheese/notes/page.html");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains("pruned   scratch-nokeep"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!scratch.exists());
+    assert!(!ref_exists(&repository, "refs/heads/scratch/nokeep"));
+}
+
+/// Control: an empty keep list and ignored files outside the patterns (such as
+/// `node_modules`) never block a prune.
+#[test]
+fn prune_removes_a_worktree_whose_ignored_files_are_outside_every_keep_pattern() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "outside", "scratch/outside");
+    ignore_everywhere(&repository, ".cheese/\nnode_modules/\n");
+    write_ignored(&scratch, "node_modules/x/index.html");
+    let config = write_repository_config(&temporary, &repository);
+    add_keep_config(&config, "\".cheese/**\", \".tmp/answers/**\"");
+    let fake_bin = fake_gh(&temporary);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    assert!(
+        stdout(&output).contains("pruned   scratch-outside"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!scratch.exists());
+    assert!(!ref_exists(&repository, "refs/heads/scratch/outside"));
+}
+
+/// Bug caught: a keep check done only during classification misses a file
+/// that appears before removal. The fake Git creates the ignored file when
+/// the second `ls-files` runs, which is the pre-removal recheck.
+#[test]
+fn prune_rechecks_the_keep_list_immediately_before_removing_a_worktree() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "late", "scratch/late");
+    ignore_everywhere(&repository, ".cheese/\n");
+    let config = write_repository_config(&temporary, &repository);
+    add_keep_config(&config, "\".cheese/**\"");
+    let fake_bin = fake_gh(&temporary);
+    let marker = temporary.path().join("ls-files-seen");
+    fake_git(
+        &fake_bin,
+        &format!(
+            r#"if [ "$1" = "ls-files" ]; then
+  if [ -e '{marker}' ]; then
+    mkdir -p .cheese/notes && echo late > .cheese/notes/page.html
+  else
+    : > '{marker}'
+  fi
+fi"#,
+            marker = marker.display()
+        ),
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains(&format!(
+            "blocked  scratch-late scratch/late {KEEP_REASON}\n"
+        )),
+        "{stdout}"
+    );
+    assert!(scratch.join(".cheese/notes/page.html").exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/late"));
+}

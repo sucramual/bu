@@ -7,6 +7,23 @@ pub struct Config {
     pub repository: RepositoryConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benches: Vec<BenchConfig>,
+    #[serde(default, skip_serializing_if = "PruneConfig::is_empty")]
+    pub prune: PruneConfig,
+}
+
+/// Optional `[prune]` table.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct PruneConfig {
+    /// Git glob pathspecs, relative to the worktree root. A worktree that holds
+    /// an ignored, untracked file matching one of them is never pruned.
+    #[serde(default)]
+    pub keep: Vec<String>,
+}
+
+impl PruneConfig {
+    fn is_empty(&self) -> bool {
+        self.keep.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -220,6 +237,8 @@ pub struct ScratchObservation {
     pub worktree: WorktreeState,
     pub branch: CurrentBranch,
     pub operation: OperationState,
+    /// Ignored, untracked files that match a `prune.keep` pattern.
+    pub kept_ignored: Vec<PathBuf>,
     pub pull_requests: PullRequestState,
 }
 
@@ -255,6 +274,8 @@ pub enum PruneSkipReason {
         protection: BranchProtection,
     },
     Dirty(Vec<DirtyFile>),
+    /// Ignored files that a `prune.keep` pattern matches.
+    KeptIgnored(Vec<PathBuf>),
     PullRequestNotChecked,
     NoPullRequest,
     OpenPullRequest(u64),
@@ -298,6 +319,11 @@ pub fn decide_scratch(
     }
     if let WorktreeState::Dirty { files } = &observation.worktree {
         return ScratchDecision::Skip(PruneSkipReason::Dirty(files.clone()));
+    }
+    if !observation.kept_ignored.is_empty() {
+        return ScratchDecision::Skip(PruneSkipReason::KeptIgnored(
+            observation.kept_ignored.clone(),
+        ));
     }
     let PullRequestState::Matches(pull_requests) = &observation.pull_requests else {
         return ScratchDecision::Skip(PruneSkipReason::PullRequestNotChecked);
@@ -354,6 +380,7 @@ mod scratch_tests {
                 commit: "tip".to_owned(),
             },
             operation: OperationState::Normal,
+            kept_ignored: Vec::new(),
             pull_requests: PullRequestState::Matches(pull_requests),
         }
     }
