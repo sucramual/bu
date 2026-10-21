@@ -6,3 +6,9 @@ main_branch = "main"
 [[benches]]
 path = "/Users/you/Documents/example-repo-01"
 standin_branch = "main-01"
+
+# Optional. `bu prune` skips a scratch worktree that holds an ignored, untracked
+# file matching one of these git glob pathspecs, relative to the worktree root.
+# Without this list, `git worktree remove` deletes ignored files silently.
+# [prune]
+# keep = [".cheese/**", ".tmp/answers/**", ".handoff/**"]

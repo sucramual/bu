@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use adapters::{GitAdapter, GitHubAdapter, ProcessAdapter};
 pub use domain::Config;
-use domain::{BenchConfig, RepositoryConfig};
+use domain::{BenchConfig, PruneConfig, RepositoryConfig};
 pub use error::AppError;
 pub use prune::{PruneFormat, PruneReport, format_prune_report};
 pub use report::{RunReport, StatusFormat, format_report, format_status_report};
@@ -69,6 +69,7 @@ fn create_default_config(path: &Path) -> Result<Config, AppError> {
             main_branch: "main".to_owned(),
         },
         benches: Vec::new(),
+        prune: PruneConfig::default(),
     };
     add_benches_from_worktrees(&mut config, &worktrees);
     write_config(path, &config)?;
