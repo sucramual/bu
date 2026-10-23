@@ -1848,3 +1848,233 @@ printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headR
     assert!(scratch.exists());
     assert!(ref_exists(&repository, "refs/heads/scratch/raced"));
 }
+
+/// Bug caught: Git reads `refs/replace/*` by default. A replacement ref that
+/// gives the merged head the local `HEAD` as its parent made `git merge-base
+/// --is-ancestor` answer yes for a diverged worktree, so prune removed commits
+/// that the merged pull request does not contain.
+#[test]
+fn prune_ignores_replacement_refs_when_it_checks_ancestry() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "grafted", "scratch/grafted");
+    let local = rev_parse(&repository, "scratch/grafted");
+    let merged = commit_on(&repository, "scratch/grafted^", "sibling commit");
+    set_merged_head(&repository, "scratch/grafted", &merged);
+    git(&repository, &["replace", "--graft", &merged, &local]);
+    // The fixture must use the replacement: plain Git now calls `local` an
+    // ancestor, while the real history is diverged.
+    let is_ancestor = |extra: &[&str]| {
+        Command::new("git")
+            .args(extra)
+            .args(["merge-base", "--is-ancestor", &local, &merged])
+            .current_dir(&repository)
+            .status()
+            .expect("git merge-base should start")
+            .code()
+    };
+    assert_eq!(
+        is_ancestor(&[]),
+        Some(0),
+        "the replacement ref has no effect"
+    );
+    assert_eq!(is_ancestor(&["--no-replace-objects"]), Some(1));
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    let worktrees_before = registered_worktrees(&repository);
+    let refs_before = git(&repository, &["show-ref"]);
+    let blocked = format!(
+        "▎ blocked  scratch-grafted scratch/grafted merged pull request #42 has head {}, not local HEAD {}\n",
+        &merged[..7],
+        &local[..7]
+    );
+
+    let dry_run = prune(&config, &fake_bin, &["--dry-run"]);
+
+    assert_success(&dry_run);
+    let dry_stdout = stdout(&dry_run);
+    assert!(
+        dry_stdout.contains(&blocked),
+        "missing {blocked:?} in\n{dry_stdout}"
+    );
+    assert!(
+        dry_stdout.contains(
+            "0 prunable, 0 stale, 1 blocked, 0 skipped, 0 failed\nDry run: no changes were made\n"
+        ),
+        "{dry_stdout}"
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains(&blocked),
+        "missing {blocked:?} in\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 pruned, 0 cleaned, 0 kept, 1 blocked, 0 skipped, 0 failed\n"),
+        "{stdout}"
+    );
+    assert!(scratch.exists());
+    assert_eq!(registered_worktrees(&repository), worktrees_before);
+    assert_eq!(git(&repository, &["show-ref"]), refs_before);
+    assert!(ref_exists(&repository, "refs/heads/scratch/grafted"));
+}
+
+/// Runs `git` in `repository` with lazy fetching off, so the check cannot fetch
+/// the object that it looks for. Git 2.44 or newer honors this.
+fn git_without_lazy_fetch(repository: &Path, arguments: &[&str]) -> Output {
+    Command::new("git")
+        .args(arguments)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .current_dir(repository)
+        .output()
+        .expect("git should start")
+}
+
+fn commit_exists_without_lazy_fetch(repository: &Path, commit: &str) -> bool {
+    git_without_lazy_fetch(
+        repository,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .status
+    .success()
+}
+
+/// Every file in the object store of `repository`, packs and loose objects
+/// alike, as sorted paths relative to `objects/`.
+fn object_store_files(repository: &Path) -> Vec<String> {
+    fn walk(root: &Path, directory: &Path, files: &mut Vec<String>) {
+        for entry in fs::read_dir(directory).expect("object directory") {
+            let path = entry.expect("object entry").path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path.strip_prefix(root).expect("path inside objects/");
+                files.push(relative.display().to_string());
+            }
+        }
+    }
+    let root = repository.join(".git/objects");
+    let mut files = Vec::new();
+    walk(&root, &root, &mut files);
+    files.sort();
+    files
+}
+
+/// Bug caught: in a partial clone, a plain `git merge-base --is-ancestor` fetches
+/// a missing merged head from the promisor remote, which is network access and
+/// an object-store write even in a dry run. It then proves ancestry, so a
+/// worktree whose merged head is not local became prunable instead of blocked.
+#[test]
+fn prune_does_not_fetch_a_missing_merged_head_in_a_partial_clone() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let origin = temporary.path().join("origin");
+    fs::create_dir(&origin).expect("origin directory");
+    git(&origin, &["init", "--initial-branch=main"]);
+    git(&origin, &["config", "user.name", "bu test"]);
+    git(&origin, &["config", "user.email", "bu@example.test"]);
+    git(&origin, &["config", "uploadpack.allowFilter", "true"]);
+    git(
+        &origin,
+        &["config", "uploadpack.allowAnySHA1InWant", "true"],
+    );
+    fs::write(origin.join("README.md"), "fixture\n").expect("fixture file");
+    fs::write(origin.join(".gitignore"), "ignored.log\n").expect("ignore fixture");
+    git(&origin, &["add", "README.md", ".gitignore"]);
+    git(&origin, &["commit", "-m", "initial fixture"]);
+
+    let repository = temporary.path().join("repository");
+    run(
+        "git",
+        &[
+            "clone",
+            "--filter=blob:none",
+            &format!("file://{}", origin.display()),
+            repository.to_str().expect("repository path is UTF-8"),
+        ],
+        temporary.path(),
+    );
+    git(&repository, &["config", "user.name", "bu test"]);
+    git(&repository, &["config", "user.email", "bu@example.test"]);
+    git(&repository, &["switch", "-c", "home"]);
+    let scratch = add_scratch(&repository, "partial", "scratch/partial");
+    let local = rev_parse(&repository, "scratch/partial");
+    git(&repository, &["push", "origin", "scratch/partial"]);
+    // The pull request head exists only in `origin`, as after a fix that
+    // someone pushed from GitHub.
+    let merged = commit_on(&origin, "scratch/partial", "review fix");
+    git(
+        &origin,
+        &["update-ref", "refs/heads/scratch/partial", &merged],
+    );
+
+    assert_eq!(
+        git(&repository, &["config", "--get", "remote.origin.promisor"]).trim(),
+        "true",
+        "the fixture must be a partial clone"
+    );
+    assert!(
+        commit_exists_without_lazy_fetch(&repository, &local),
+        "the local commit must exist, so the next check is about the merged head"
+    );
+    assert!(
+        !commit_exists_without_lazy_fetch(&repository, &merged),
+        "the merged head must be absent from the clone; Git 2.44 or newer is needed for GIT_NO_LAZY_FETCH"
+    );
+
+    let config = write_repository_config(&temporary, &repository);
+    let bin = temporary.path().join("bin");
+    fs::create_dir(&bin).expect("bin directory");
+    fake_lsof(&bin, "exit 0");
+    write_executable(
+        &bin.join("gh"),
+        &format!(
+            r#"#!/bin/sh
+pull_requests() {{
+printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"scratch/partial","headRefOid":"{merged}"}}]\n'
+}}
+{GRAPHQL_DISPATCH}"#
+        ),
+    );
+    let objects_before = object_store_files(&repository);
+    let blocked = format!(
+        "▎ blocked  scratch-partial scratch/partial merged pull request #42 has head {}, not local HEAD {}; its head commit is not in the local repository\n",
+        &merged[..7],
+        &local[..7]
+    );
+
+    let dry_run = prune(&config, &bin, &["--dry-run"]);
+
+    assert_success(&dry_run);
+    let dry_stdout = stdout(&dry_run);
+    assert!(
+        dry_stdout.contains(&blocked),
+        "missing {blocked:?} in\n{dry_stdout}"
+    );
+    assert!(
+        dry_stdout.contains(
+            "0 prunable, 0 stale, 1 blocked, 0 skipped, 0 failed\nDry run: no changes were made\n"
+        ),
+        "{dry_stdout}"
+    );
+    assert!(!commit_exists_without_lazy_fetch(&repository, &merged));
+    assert_eq!(object_store_files(&repository), objects_before);
+
+    let output = prune(&config, &bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.contains(&blocked),
+        "missing {blocked:?} in\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 pruned, 0 cleaned, 0 kept, 1 blocked, 0 skipped, 0 failed\n"),
+        "{stdout}"
+    );
+    assert!(!commit_exists_without_lazy_fetch(&repository, &merged));
+    assert_eq!(object_store_files(&repository), objects_before);
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/partial"));
+}

@@ -25,8 +25,18 @@ fn run_command(
     program: &str,
     arguments: &[String],
 ) -> Result<CommandOutput, AdapterError> {
+    run_command_with_env(cwd, program, arguments, &[])
+}
+
+fn run_command_with_env(
+    cwd: &Path,
+    program: &str,
+    arguments: &[String],
+    environment: &[(&str, &str)],
+) -> Result<CommandOutput, AdapterError> {
     let output = Command::new(program)
         .args(arguments)
+        .envs(environment.iter().copied())
         .current_dir(cwd)
         .output()
         .map_err(|source| AdapterError::Spawn {
@@ -46,6 +56,21 @@ fn run_command(
         raw_stdout: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
+}
+
+/// Runs `git` for a command whose result `bu prune` accepts as proof of ancestry.
+/// `GIT_NO_REPLACE_OBJECTS` stops Git from reading `refs/replace/*`, which can
+/// graft a different parent onto a commit and so invent history.
+/// `GIT_NO_LAZY_FETCH` stops a partial clone from fetching a missing commit from
+/// its promisor remote, which is network access and an object-store write.
+/// Git 2.44 or newer reads `GIT_NO_LAZY_FETCH`; older Git ignores it.
+fn run_proof_git(worktree: &Path, arguments: &[String]) -> Result<CommandOutput, AdapterError> {
+    run_command_with_env(
+        worktree,
+        "git",
+        arguments,
+        &[("GIT_NO_REPLACE_OBJECTS", "1"), ("GIT_NO_LAZY_FETCH", "1")],
+    )
 }
 
 fn arguments(values: &[&str]) -> Vec<String> {
@@ -179,9 +204,8 @@ impl GitAdapter {
         local: &str,
         merged: &str,
     ) -> Result<HeadAncestry, AdapterError> {
-        let output = run_command(
+        let output = run_proof_git(
             worktree,
-            "git",
             &arguments(&["merge-base", "--is-ancestor", local, merged]),
         )?;
         if output.success {
@@ -192,9 +216,8 @@ impl GitAdapter {
         if output.status == "1" {
             return Ok(HeadAncestry::NotAncestor);
         }
-        let verify = run_command(
+        let verify = run_proof_git(
             worktree,
-            "git",
             &arguments(&[
                 "rev-parse",
                 "--verify",
@@ -210,9 +233,8 @@ impl GitAdapter {
 
     /// Counts the commits reachable from `to` but not from `from`.
     fn commits_between(&self, worktree: &Path, from: &str, to: &str) -> Result<u64, AdapterError> {
-        let output = run_command(
+        let output = run_proof_git(
             worktree,
-            "git",
             &arguments(&["rev-list", "--count", &format!("{from}..{to}")]),
         )?;
         if !output.success {
