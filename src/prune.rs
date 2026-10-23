@@ -8,8 +8,9 @@ use crate::adapters::{
     CwdProcess, GitAdapter, GitHubAdapter, GitWorktree, ProcessAdapter, ScratchHead,
 };
 use crate::domain::{
-    BranchProtection, Config, CurrentBranch, ProtectedBranches, PruneSkipReason, PullRequestState,
-    ScratchDecision, ScratchObservation, decide_scratch, scratch_needs_pull_requests,
+    BranchProtection, Config, CurrentBranch, HeadAncestry, HeadProof, ProtectedBranches,
+    PruneSkipReason, PullRequestState, ScratchDecision, ScratchObservation, decide_scratch,
+    scratch_needs_pull_requests,
 };
 use crate::error::AdapterError;
 use crate::report::{
@@ -42,9 +43,11 @@ pub struct PruneItem {
 pub enum PruneOutcome {
     Prunable {
         pull_request: u64,
+        proof: HeadProof,
     },
     Pruned {
         pull_request: u64,
+        proof: HeadProof,
         config_note: Option<String>,
     },
     BranchKept {
@@ -349,14 +352,24 @@ fn classify_concurrently(
         Some(result) => Prefetched::new(listed_branches, result),
     };
     attach_pull_requests(github, repository, &mut observations, protected, prefetched);
+    let paths: Vec<&Path> = scratch
+        .iter()
+        .map(|worktree| worktree.path.as_path())
+        .collect();
+    attach_head_ancestry(git, &paths, &mut observations, protected);
     observations
         .into_iter()
         .map(|observation| match observation {
             Err(failure) => failure,
             Ok(observation) => match decide_scratch(&observation, protected) {
-                ScratchDecision::Prunable { pull_request, .. } => {
-                    PruneOutcome::Prunable { pull_request }
-                }
+                ScratchDecision::Prunable {
+                    pull_request,
+                    proof,
+                    ..
+                } => PruneOutcome::Prunable {
+                    pull_request,
+                    proof,
+                },
                 ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
             },
         })
@@ -527,12 +540,13 @@ fn remove_scratch(
         Err(outcome) => return outcome,
     };
     *displayed_branch = branch_name(&observation.branch).to_owned();
-    let (branch, commit, pull_request) = match decide_scratch(&observation, protected) {
+    let (branch, commit, pull_request, proof) = match decide_scratch(&observation, protected) {
         ScratchDecision::Prunable {
             branch,
             commit,
             pull_request,
-        } => (branch, commit, pull_request),
+            proof,
+        } => (branch, commit, pull_request, proof),
         ScratchDecision::Skip(reason) => return PruneOutcome::Skipped(reason),
     };
     // Checked last because a process can start while the GitHub lookup runs.
@@ -556,9 +570,11 @@ fn remove_scratch(
             error: error.to_string(),
         };
     }
+    // `commit` is local HEAD, never the merged head.
     match git.delete_branch_if_unchanged(repository, &branch, &commit) {
         Ok(()) => PruneOutcome::Pruned {
             pull_request,
+            proof,
             config_note: git
                 .remove_branch_config(repository, &branch)
                 .err()
@@ -605,12 +621,14 @@ fn observe_scratch(
         protected,
         Prefetched::default(),
     );
+    attach_head_ancestry(git, &[path], &mut observations, protected);
     let [observation] = observations;
     observation
 }
 
-/// Reads everything but the pull requests, which stay `NotChecked` until
-/// `attach_pull_requests` fills them.
+/// Reads everything but the pull requests and the head ancestry, which stay
+/// `NotChecked` until `attach_pull_requests` and `attach_head_ancestry` fill
+/// them.
 fn observe_scratch_git(
     git: &GitAdapter,
     path: &Path,
@@ -651,7 +669,44 @@ fn observe_scratch_git(
         operation,
         kept_ignored,
         pull_requests: PullRequestState::NotChecked,
+        head_ancestry: HeadAncestry::NotChecked,
     })
+}
+
+/// Asks Git, in each worktree of `paths`, whether local `HEAD` is behind the
+/// head of its one merged pull request. Only observations that every other
+/// check passes and that are blocked by a head mismatch pay for it.
+/// `observations` holds one entry per path, in the same order. A failed check
+/// fails that worktree.
+fn attach_head_ancestry(
+    git: &GitAdapter,
+    paths: &[&Path],
+    observations: &mut [Result<ScratchObservation, PruneOutcome>],
+    protected: &ProtectedBranches,
+) {
+    for (path, observation) in paths.iter().zip(observations.iter_mut()) {
+        let Ok(scratch) = observation else { continue };
+        if !matches!(scratch.head_ancestry, HeadAncestry::NotChecked) {
+            continue;
+        }
+        let ScratchDecision::Skip(PruneSkipReason::HeadMismatch {
+            pull_request_head,
+            local_head,
+            ..
+        }) = decide_scratch(scratch, protected)
+        else {
+            continue;
+        };
+        match git.head_ancestry(path, &local_head, &pull_request_head) {
+            Ok(ancestry) => scratch.head_ancestry = ancestry,
+            Err(error) => {
+                *observation = Err(PruneOutcome::Failed {
+                    summary: "ancestry check failed",
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Fills pull requests for every observation that needs them, from
@@ -867,15 +922,40 @@ fn short(commit: &str) -> &str {
     commit.get(..7).unwrap_or(commit)
 }
 
+/// Names the proof in a prunable or pruned row. An exact match adds nothing,
+/// so those rows keep their original wording.
+fn proof_clause(proof: HeadProof, verb: &str) -> String {
+    match proof {
+        HeadProof::Exact => String::new(),
+        HeadProof::Behind(commits) => {
+            let commit_word = if commits == 1 { "commit" } else { "commits" };
+            format!("local HEAD {verb} {commits} {commit_word} behind its head; ")
+        }
+    }
+}
+
 fn describe(outcome: &PruneOutcome) -> (Role, String) {
     match outcome {
-        PruneOutcome::Prunable { pull_request } => (
+        PruneOutcome::Prunable {
+            pull_request,
+            proof,
+        } => (
             Role::Prunable,
-            format!("merged pull request #{pull_request}; would remove worktree and branch"),
+            format!(
+                "merged pull request #{pull_request}; {}would remove worktree and branch",
+                proof_clause(*proof, "is")
+            ),
         ),
-        PruneOutcome::Pruned { pull_request, .. } => (
+        PruneOutcome::Pruned {
+            pull_request,
+            proof,
+            ..
+        } => (
             Role::Pruned,
-            format!("merged pull request #{pull_request}; removed worktree and branch"),
+            format!(
+                "merged pull request #{pull_request}; {}removed worktree and branch",
+                proof_clause(*proof, "was")
+            ),
         ),
         PruneOutcome::BranchKept {
             pull_request,
@@ -1003,6 +1083,18 @@ fn describe_skip(reason: &PruneSkipReason) -> (Role, String) {
             Role::Blocked,
             format!(
                 "merged pull request #{pull_request} has head {}, not local HEAD {}",
+                short(pull_request_head),
+                short(local_head)
+            ),
+        ),
+        PruneSkipReason::MergedHeadMissing {
+            pull_request,
+            pull_request_head,
+            local_head,
+        } => (
+            Role::Blocked,
+            format!(
+                "merged pull request #{pull_request} has head {}, not local HEAD {}; its head commit is not in the local repository",
                 short(pull_request_head),
                 short(local_head)
             ),

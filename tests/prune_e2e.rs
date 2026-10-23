@@ -7,6 +7,9 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const MISMATCHED_HEAD: &str = "0000000000000000000000000000000000000000";
+/// A merged head that no fixture repository holds. It is not the all-zero OID,
+/// which Git reserves as the null object ID.
+const MISSING_HEAD: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
 fn run(program: &str, arguments: &[&str], cwd: &Path) -> Output {
     let output = Command::new(program)
@@ -157,8 +160,10 @@ printf '}}}
 '"#;
 
 /// Fake `gh`: every branch has one merged pull request at its local tip unless a
-/// branch-specific case below says otherwise. Also installs a fake `lsof` that
-/// reports no processes, so tests never depend on the host's process table.
+/// branch-specific case below says otherwise. `refs/pr-heads/<branch>`, when it
+/// exists, replaces the local tip as that merged head. Also installs a fake
+/// `lsof` that reports no processes, so tests never depend on the host's
+/// process table.
 fn fake_gh(temporary: &TempDir) -> PathBuf {
     let bin = temporary.path().join("bin");
     fs::create_dir(&bin).expect("bin directory");
@@ -170,6 +175,7 @@ fn fake_gh(temporary: &TempDir) -> PathBuf {
 pull_requests() {{
 head="$1"
 oid=$(git rev-parse --verify --quiet "refs/heads/$head")
+pr_head=$(git rev-parse --verify --quiet "refs/pr-heads/$head")
 case "$head" in
   scratch/none)
     printf '[]\n' ;;
@@ -183,8 +189,10 @@ case "$head" in
     printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"%s"}},{{"number":43,"state":"MERGED","mergedAt":"2026-07-29T00:00:00Z","headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "$oid" "$head" "$oid" ;;
   scratch/other-branch)
     printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"someone/else","headRefOid":"%s"}}]\n' "$oid" ;;
+  scratch/missing)
+    printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"{MISSING_HEAD}"}}]\n' "$head" ;;
   *)
-    printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "$oid" ;;
+    printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "${{pr_head:-$oid}}" ;;
 esac
 }}
 {GRAPHQL_DISPATCH}"#
@@ -1480,4 +1488,363 @@ fi"#,
     );
     assert!(scratch.join(".cheese/notes/page.html").exists());
     assert!(ref_exists(&repository, "refs/heads/scratch/late"));
+}
+
+fn rev_parse(repository: &Path, revision: &str) -> String {
+    git(repository, &["rev-parse", "--verify", revision])
+        .trim()
+        .to_owned()
+}
+
+/// Creates a commit on `parent` that reuses the tree of `parent`, and returns
+/// its OID. No branch moves.
+fn commit_on(repository: &Path, parent: &str, message: &str) -> String {
+    git(
+        repository,
+        &[
+            "commit-tree",
+            &format!("{parent}^{{tree}}"),
+            "-p",
+            parent,
+            "-m",
+            message,
+        ],
+    )
+    .trim()
+    .to_owned()
+}
+
+/// Makes the fake `gh` report `commit` as the merged head of `branch`. The ref
+/// also keeps `commit` reachable.
+fn set_merged_head(repository: &Path, branch: &str, commit: &str) {
+    git(
+        repository,
+        &["update-ref", &format!("refs/pr-heads/{branch}"), commit],
+    );
+}
+
+fn commit_exists(repository: &Path, commit: &str) -> bool {
+    Command::new("git")
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .current_dir(repository)
+        .status()
+        .expect("git cat-file should start")
+        .success()
+}
+
+/// Bug caught: `review-pr` pushes review fixes from another worktree, so the
+/// original worktree stays behind its merged head. With only an exact match as
+/// proof, prune blocked it with `has head X, not local HEAD Y` forever.
+#[test]
+fn prune_removes_a_worktree_whose_head_is_behind_the_merged_head() {
+    let (temporary, repository) = prune_fixture();
+    let two = add_scratch(&repository, "behind-two", "scratch/behind-two");
+    let one = add_scratch(&repository, "behind-one", "scratch/behind-one");
+    let first_fix = commit_on(&repository, "scratch/behind-two", "review fix 1");
+    let merged_two = commit_on(&repository, &first_fix, "review fix 2");
+    let merged_one = commit_on(&repository, "scratch/behind-one", "review fix");
+    let merged_heads = [
+        ("scratch/behind-two", &merged_two),
+        ("scratch/behind-one", &merged_one),
+    ];
+    for (branch, merged) in merged_heads {
+        set_merged_head(&repository, branch, merged);
+        git(
+            &repository,
+            &[
+                "update-ref",
+                &format!("refs/remotes/origin/{branch}"),
+                merged,
+            ],
+        );
+    }
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    let worktrees_before = registered_worktrees(&repository);
+    let refs_before = git(&repository, &["show-ref"]);
+
+    let dry_run = prune(&config, &fake_bin, &["--dry-run"]);
+
+    assert_success(&dry_run);
+    let dry_stdout = stdout(&dry_run);
+    for expected in [
+        "▎ prunable scratch-behind-two scratch/behind-two merged pull request #42; local HEAD is 2 commits behind its head; would remove worktree and branch\n",
+        "▎ prunable scratch-behind-one scratch/behind-one merged pull request #42; local HEAD is 1 commit behind its head; would remove worktree and branch\n",
+        "\nChecked 2 scratch worktrees\n2 prunable, 0 stale, 0 blocked, 0 skipped, 0 failed\nDry run: no changes were made\n",
+    ] {
+        assert!(
+            dry_stdout.contains(expected),
+            "missing {expected:?} in\n{dry_stdout}"
+        );
+    }
+    assert_eq!(registered_worktrees(&repository), worktrees_before);
+    assert_eq!(git(&repository, &["show-ref"]), refs_before);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    for expected in [
+        "▎ pruned   scratch-behind-two scratch/behind-two merged pull request #42; local HEAD was 2 commits behind its head; removed worktree and branch\n",
+        "▎ pruned   scratch-behind-one scratch/behind-one merged pull request #42; local HEAD was 1 commit behind its head; removed worktree and branch\n",
+        "\nChecked 2 scratch worktrees\n2 pruned, 0 cleaned, 0 kept, 0 blocked, 0 skipped, 0 failed\n",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in\n{stdout}"
+        );
+    }
+    assert!(!two.exists());
+    assert!(!one.exists());
+    let worktrees = registered_worktrees(&repository);
+    assert!(!worktrees.contains("scratch-behind"), "{worktrees}");
+    assert!(!ref_exists(&repository, "refs/heads/scratch/behind-two"));
+    assert!(!ref_exists(&repository, "refs/heads/scratch/behind-one"));
+    for (branch, merged) in merged_heads {
+        assert!(commit_exists(&repository, merged), "{branch}");
+        assert_eq!(
+            rev_parse(&repository, &format!("refs/remotes/origin/{branch}")),
+            *merged
+        );
+    }
+}
+
+/// Guards the direction of the ancestry check. With the `merge-base` arguments
+/// reversed, the `ahead` worktree would be pruned and its commit after the
+/// merge lost. Every case here was already a head mismatch, so this test also
+/// passes before ADR-004.
+#[test]
+fn prune_blocks_local_commits_that_the_merged_head_lacks() {
+    let (temporary, repository) = prune_fixture();
+    let ahead = add_scratch(&repository, "ahead", "scratch/ahead");
+    fs::write(ahead.join("after-merge.md"), "after merge\n").expect("later change");
+    git(&ahead, &["add", "after-merge.md"]);
+    git(&ahead, &["commit", "-m", "commit after the merge"]);
+    let ahead_local = rev_parse(&repository, "scratch/ahead");
+    let ahead_merged = rev_parse(&repository, "scratch/ahead^");
+    set_merged_head(&repository, "scratch/ahead", &ahead_merged);
+
+    let diverged = add_scratch(&repository, "diverged", "scratch/diverged");
+    let diverged_local = rev_parse(&repository, "scratch/diverged");
+    let diverged_merged = commit_on(&repository, "scratch/diverged^", "sibling commit");
+    set_merged_head(&repository, "scratch/diverged", &diverged_merged);
+
+    // Models a rebased pull request: main advanced, and the pull request head
+    // became a copy of the local commit on top of it.
+    let rewritten = add_scratch(&repository, "rewritten", "scratch/rewritten");
+    let rewritten_local = rev_parse(&repository, "scratch/rewritten");
+    let rebase = temporary.path().join("rebase");
+    let rebase_path = rebase.to_str().expect("path is UTF-8");
+    git(
+        &repository,
+        &["worktree", "add", "--detach", rebase_path, "main"],
+    );
+    fs::write(rebase.join("main.md"), "main advanced\n").expect("main change");
+    git(&rebase, &["add", "main.md"]);
+    git(&rebase, &["commit", "-m", "main advanced"]);
+    git(
+        &repository,
+        &["update-ref", "refs/heads/main", &rev_parse(&rebase, "HEAD")],
+    );
+    git(&rebase, &["cherry-pick", &rewritten_local]);
+    let rewritten_merged = rev_parse(&rebase, "HEAD");
+    git(&repository, &["worktree", "remove", rebase_path]);
+    set_merged_head(&repository, "scratch/rewritten", &rewritten_merged);
+    assert_eq!(
+        git(
+            &repository,
+            &["show", &format!("{rewritten_merged}:rewritten.md")]
+        ),
+        "rewritten\n",
+        "fixture must merge the same change"
+    );
+
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    let worktrees_before = registered_worktrees(&repository);
+    let refs_before = git(&repository, &["show-ref"]);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    for (row, merged, local) in [
+        ("scratch-ahead scratch/ahead", &ahead_merged, &ahead_local),
+        (
+            "scratch-diverged scratch/diverged",
+            &diverged_merged,
+            &diverged_local,
+        ),
+        (
+            "scratch-rewritten scratch/rewritten",
+            &rewritten_merged,
+            &rewritten_local,
+        ),
+    ] {
+        let expected = format!(
+            "▎ blocked  {row} merged pull request #42 has head {}, not local HEAD {}\n",
+            &merged[..7],
+            &local[..7]
+        );
+        assert!(
+            stdout.contains(&expected),
+            "missing {expected:?} in\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains(
+            "\nChecked 3 scratch worktrees\n0 pruned, 0 cleaned, 0 kept, 3 blocked, 0 skipped, 0 failed\n"
+        ),
+        "{stdout}"
+    );
+    for path in [&ahead, &diverged, &rewritten] {
+        assert!(path.exists(), "{} was removed", path.display());
+    }
+    assert_eq!(registered_worktrees(&repository), worktrees_before);
+    assert_eq!(git(&repository, &["show-ref"]), refs_before);
+}
+
+/// Bug caught: a merged head that is not in the local object store, such as a
+/// fix pushed from GitHub, must stay blocked with its own reason. It must not
+/// fail the daily job, and `bu` must not fetch it.
+#[test]
+fn prune_blocks_a_worktree_whose_merged_head_is_not_in_the_local_repository() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "missing", "scratch/missing");
+    let local = rev_parse(&repository, "scratch/missing");
+    // The fixture must model a commit that Git cannot find, not a Git failure.
+    let is_ancestor = Command::new("git")
+        .args(["merge-base", "--is-ancestor", &local, MISSING_HEAD])
+        .current_dir(&repository)
+        .output()
+        .expect("git merge-base should start");
+    assert_eq!(is_ancestor.status.code(), Some(128));
+    let verify = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{MISSING_HEAD}^{{commit}}"),
+        ])
+        .current_dir(&repository)
+        .output()
+        .expect("git rev-parse should start");
+    assert_eq!(verify.status.code(), Some(1));
+    assert!(verify.stdout.is_empty());
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let expected = format!(
+        "▎ blocked  scratch-missing scratch/missing merged pull request #42 has head {}, not local HEAD {}; its head commit is not in the local repository\n",
+        &MISSING_HEAD[..7],
+        &local[..7]
+    );
+    assert!(
+        stdout.contains(&expected),
+        "missing {expected:?} in\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 pruned, 0 cleaned, 0 kept, 1 blocked, 0 skipped, 0 failed\n"),
+        "{stdout}"
+    );
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/missing"));
+}
+
+/// Bug caught: reading every nonzero `merge-base` status as "not an ancestor"
+/// hides a real Git failure behind an ordinary blocked row.
+#[test]
+fn prune_fails_a_worktree_whose_ancestry_check_errors() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "broken", "scratch/broken");
+    let merged = commit_on(&repository, "scratch/broken", "review fix");
+    set_merged_head(&repository, "scratch/broken", &merged);
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    fake_git(
+        &fake_bin,
+        r#"if [ "$1" = "merge-base" ] && [ "$2" = "--is-ancestor" ]; then
+  printf 'fatal: simulated ancestry failure\n' >&2
+  exit 2
+fi"#,
+    );
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    let stdout = stdout(&output);
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains(
+            "▎ failed   scratch-broken scratch/broken ancestry check failed\n    error: "
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("simulated ancestry failure"), "{stdout}");
+    assert!(
+        stdout.contains("0 pruned, 0 cleaned, 0 kept, 0 blocked, 0 skipped, 1 failed\n"),
+        "{stdout}"
+    );
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/broken"));
+}
+
+/// Bug caught: an ancestry proof made only during classification survives a
+/// force-push before removal. The first lookup reports a descendant of local
+/// `HEAD`; the pre-removal lookup reports a sibling commit.
+#[test]
+fn prune_rechecks_ancestry_immediately_before_removing_a_worktree() {
+    let (temporary, repository) = prune_fixture();
+    let scratch = add_scratch(&repository, "raced", "scratch/raced");
+    let local = rev_parse(&repository, "scratch/raced");
+    let descendant = commit_on(&repository, &local, "review fix");
+    let sibling = commit_on(&repository, &format!("{local}^"), "force-pushed rewrite");
+    git(
+        &repository,
+        &["update-ref", "refs/pr-heads/descendant", &descendant],
+    );
+    git(
+        &repository,
+        &["update-ref", "refs/pr-heads/sibling", &sibling],
+    );
+    let counter = temporary.path().join("gh-count");
+    let config = write_repository_config(&temporary, &repository);
+    let bin = temporary.path().join("bin");
+    fs::create_dir(&bin).expect("bin directory");
+    fake_lsof(&bin, "exit 0");
+    write_executable(
+        &bin.join("gh"),
+        &format!(
+            r#"#!/bin/sh
+count_file='{counter}'
+count=$(cat "$count_file" 2>/dev/null || printf 0)
+printf '%s' "$((count + 1))" > "$count_file"
+if [ "$count" -eq 0 ]; then oid='{descendant}'; else oid='{sibling}'; fi
+pull_requests() {{
+printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"scratch/raced","headRefOid":"%s"}}]\n' "$oid"
+}}
+{GRAPHQL_DISPATCH}"#,
+            counter = counter.display(),
+        ),
+    );
+
+    let output = prune(&config, &bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let expected = format!(
+        "▎ blocked  scratch-raced scratch/raced merged pull request #42 has head {}, not local HEAD {}\n",
+        &sibling[..7],
+        &local[..7]
+    );
+    assert!(
+        stdout.contains(&expected),
+        "missing {expected:?} in\n{stdout}"
+    );
+    assert_eq!(fs::read_to_string(&counter).expect("gh count"), "2");
+    assert!(scratch.exists());
+    assert!(ref_exists(&repository, "refs/heads/scratch/raced"));
 }

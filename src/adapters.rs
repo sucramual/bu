@@ -5,8 +5,8 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::domain::{
-    CurrentBranch, DirtyFile, GitOperation, OperationState, PullRequest, PullRequestLifecycle,
-    PullRequestState, StandinState, WorktreeState,
+    CurrentBranch, DirtyFile, GitOperation, HeadAncestry, OperationState, PullRequest,
+    PullRequestLifecycle, PullRequestState, StandinState, WorktreeState,
 };
 use crate::error::AdapterError;
 
@@ -165,6 +165,63 @@ impl GitAdapter {
             toplevel,
             branch,
             operation: operation_state_from(worktree, markers),
+        })
+    }
+
+    /// Asks whether `local` is an ancestor of `merged`, the different head
+    /// commit of a merged pull request, without fetching. Only exit status 0
+    /// of `git merge-base --is-ancestor` is proof, and 1 means "no". Any other
+    /// result is unknown: if `git rev-parse` then reports `merged` missing, the
+    /// answer is `MissingHead`; otherwise the `merge-base` failure is returned.
+    pub fn head_ancestry(
+        &self,
+        worktree: &Path,
+        local: &str,
+        merged: &str,
+    ) -> Result<HeadAncestry, AdapterError> {
+        let output = run_command(
+            worktree,
+            "git",
+            &arguments(&["merge-base", "--is-ancestor", local, merged]),
+        )?;
+        if output.success {
+            return self
+                .commits_between(worktree, local, merged)
+                .map(HeadAncestry::Behind);
+        }
+        if output.status == "1" {
+            return Ok(HeadAncestry::NotAncestor);
+        }
+        let verify = run_command(
+            worktree,
+            "git",
+            &arguments(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{merged}^{{commit}}"),
+            ]),
+        )?;
+        if verify.status == "1" && verify.stdout.is_empty() {
+            return Ok(HeadAncestry::MissingHead);
+        }
+        Err(unexpected_exit("git merge-base", worktree, output))
+    }
+
+    /// Counts the commits reachable from `to` but not from `from`.
+    fn commits_between(&self, worktree: &Path, from: &str, to: &str) -> Result<u64, AdapterError> {
+        let output = run_command(
+            worktree,
+            "git",
+            &arguments(&["rev-list", "--count", &format!("{from}..{to}")]),
+        )?;
+        if !output.success {
+            return Err(unexpected_exit("git rev-list", worktree, output));
+        }
+        let count = output.stdout.trim();
+        count.parse().map_err(|_| AdapterError::InvalidRevList {
+            cwd: worktree.to_path_buf(),
+            message: format!("expected a commit count, got {count:?}"),
         })
     }
 

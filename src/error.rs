@@ -57,6 +57,8 @@ pub enum AdapterError {
     InvalidWorktreeList { cwd: PathBuf, message: String },
     #[error("could not parse git rev-parse output in {cwd}: {message}")]
     InvalidRevParse { cwd: PathBuf, message: String },
+    #[error("could not parse git rev-list output in {cwd}: {message}")]
+    InvalidRevList { cwd: PathBuf, message: String },
     #[error("could not parse lsof output: {message}")]
     InvalidProcessList { message: String },
     #[error(
