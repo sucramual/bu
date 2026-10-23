@@ -5,8 +5,8 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::domain::{
-    CurrentBranch, DirtyFile, GitOperation, OperationState, PullRequest, PullRequestLifecycle,
-    PullRequestState, StandinState, WorktreeState,
+    CurrentBranch, DirtyFile, GitOperation, HeadAncestry, OperationState, PullRequest,
+    PullRequestLifecycle, PullRequestState, StandinState, WorktreeState,
 };
 use crate::error::AdapterError;
 
@@ -25,8 +25,18 @@ fn run_command(
     program: &str,
     arguments: &[String],
 ) -> Result<CommandOutput, AdapterError> {
+    run_command_with_env(cwd, program, arguments, &[])
+}
+
+fn run_command_with_env(
+    cwd: &Path,
+    program: &str,
+    arguments: &[String],
+    environment: &[(&str, &str)],
+) -> Result<CommandOutput, AdapterError> {
     let output = Command::new(program)
         .args(arguments)
+        .envs(environment.iter().copied())
         .current_dir(cwd)
         .output()
         .map_err(|source| AdapterError::Spawn {
@@ -46,6 +56,21 @@ fn run_command(
         raw_stdout: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
     })
+}
+
+/// Runs `git` for a command whose result `bu prune` accepts as proof of ancestry.
+/// `GIT_NO_REPLACE_OBJECTS` stops Git from reading `refs/replace/*`, which can
+/// graft a different parent onto a commit and so invent history.
+/// `GIT_NO_LAZY_FETCH` stops a partial clone from fetching a missing commit from
+/// its promisor remote, which is network access and an object-store write.
+/// Git 2.44 or newer reads `GIT_NO_LAZY_FETCH`; older Git ignores it.
+fn run_proof_git(worktree: &Path, arguments: &[String]) -> Result<CommandOutput, AdapterError> {
+    run_command_with_env(
+        worktree,
+        "git",
+        arguments,
+        &[("GIT_NO_REPLACE_OBJECTS", "1"), ("GIT_NO_LAZY_FETCH", "1")],
+    )
 }
 
 fn arguments(values: &[&str]) -> Vec<String> {
@@ -165,6 +190,60 @@ impl GitAdapter {
             toplevel,
             branch,
             operation: operation_state_from(worktree, markers),
+        })
+    }
+
+    /// Asks whether `local` is an ancestor of `merged`, the different head
+    /// commit of a merged pull request, without fetching. Only exit status 0
+    /// of `git merge-base --is-ancestor` is proof, and 1 means "no". Any other
+    /// result is unknown: if `git rev-parse` then reports `merged` missing, the
+    /// answer is `MissingHead`; otherwise the `merge-base` failure is returned.
+    pub fn head_ancestry(
+        &self,
+        worktree: &Path,
+        local: &str,
+        merged: &str,
+    ) -> Result<HeadAncestry, AdapterError> {
+        let output = run_proof_git(
+            worktree,
+            &arguments(&["merge-base", "--is-ancestor", local, merged]),
+        )?;
+        if output.success {
+            return self
+                .commits_between(worktree, local, merged)
+                .map(HeadAncestry::Behind);
+        }
+        if output.status == "1" {
+            return Ok(HeadAncestry::NotAncestor);
+        }
+        let verify = run_proof_git(
+            worktree,
+            &arguments(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{merged}^{{commit}}"),
+            ]),
+        )?;
+        if verify.status == "1" && verify.stdout.is_empty() {
+            return Ok(HeadAncestry::MissingHead);
+        }
+        Err(unexpected_exit("git merge-base", worktree, output))
+    }
+
+    /// Counts the commits reachable from `to` but not from `from`.
+    fn commits_between(&self, worktree: &Path, from: &str, to: &str) -> Result<u64, AdapterError> {
+        let output = run_proof_git(
+            worktree,
+            &arguments(&["rev-list", "--count", &format!("{from}..{to}")]),
+        )?;
+        if !output.success {
+            return Err(unexpected_exit("git rev-list", worktree, output));
+        }
+        let count = output.stdout.trim();
+        count.parse().map_err(|_| AdapterError::InvalidRevList {
+            cwd: worktree.to_path_buf(),
+            message: format!("expected a commit count, got {count:?}"),
         })
     }
 

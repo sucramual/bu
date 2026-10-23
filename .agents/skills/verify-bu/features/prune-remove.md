@@ -1,6 +1,6 @@
 # Prune removal
 
-`bu prune` removes a scratch worktree and deletes its branch only when the worktree is clean, unlocked, attached to a non-protected branch, and GitHub reports exactly one merged pull request at local `HEAD`. It rechecks every condition just before each removal.
+`bu prune` removes a scratch worktree and deletes its branch only when the worktree is clean, unlocked, attached to a non-protected branch, and GitHub reports exactly one merged pull request. Its head commit must equal local `HEAD`, or local `HEAD` must be a strict ancestor of it. It rechecks every condition just before each removal.
 
 ## Sub-features
 
