@@ -9,8 +9,8 @@ use crate::adapters::{
 };
 use crate::domain::{
     BranchProtection, Config, CurrentBranch, HeadAncestry, HeadProof, ProtectedBranches,
-    PruneSkipReason, PullRequestState, ScratchDecision, ScratchObservation, decide_scratch,
-    scratch_needs_pull_requests,
+    PruneSkipReason, PullRequestResolution, PullRequestState, ScratchDecision, ScratchObservation,
+    decide_scratch, scratch_needs_pull_requests,
 };
 use crate::error::AdapterError;
 use crate::report::{
@@ -43,15 +43,18 @@ pub struct PruneItem {
 pub enum PruneOutcome {
     Prunable {
         pull_request: u64,
+        resolution: PullRequestResolution,
         proof: HeadProof,
     },
     Pruned {
         pull_request: u64,
+        resolution: PullRequestResolution,
         proof: HeadProof,
         config_note: Option<String>,
     },
     BranchKept {
         pull_request: u64,
+        resolution: PullRequestResolution,
         current_commit: Option<String>,
     },
     Stale,
@@ -364,10 +367,12 @@ fn classify_concurrently(
             Ok(observation) => match decide_scratch(&observation, protected) {
                 ScratchDecision::Prunable {
                     pull_request,
+                    resolution,
                     proof,
                     ..
                 } => PruneOutcome::Prunable {
                     pull_request,
+                    resolution,
                     proof,
                 },
                 ScratchDecision::Skip(reason) => PruneOutcome::Skipped(reason),
@@ -540,15 +545,17 @@ fn remove_scratch(
         Err(outcome) => return outcome,
     };
     *displayed_branch = branch_name(&observation.branch).to_owned();
-    let (branch, commit, pull_request, proof) = match decide_scratch(&observation, protected) {
-        ScratchDecision::Prunable {
-            branch,
-            commit,
-            pull_request,
-            proof,
-        } => (branch, commit, pull_request, proof),
-        ScratchDecision::Skip(reason) => return PruneOutcome::Skipped(reason),
-    };
+    let (branch, commit, pull_request, resolution, proof) =
+        match decide_scratch(&observation, protected) {
+            ScratchDecision::Prunable {
+                branch,
+                commit,
+                pull_request,
+                resolution,
+                proof,
+            } => (branch, commit, pull_request, resolution, proof),
+            ScratchDecision::Skip(reason) => return PruneOutcome::Skipped(reason),
+        };
     // Checked last because a process can start while the GitHub lookup runs.
     match live_processes(processes, repository) {
         Ok(live) => {
@@ -570,10 +577,11 @@ fn remove_scratch(
             error: error.to_string(),
         };
     }
-    // `commit` is local HEAD, never the merged head.
+    // `commit` is local HEAD, never the pull-request head.
     match git.delete_branch_if_unchanged(repository, &branch, &commit) {
         Ok(()) => PruneOutcome::Pruned {
             pull_request,
+            resolution,
             proof,
             config_note: git
                 .remove_branch_config(repository, &branch)
@@ -585,6 +593,7 @@ fn remove_scratch(
                 Ok(current) if current.as_deref() != Some(commit.as_str()) => {
                     PruneOutcome::BranchKept {
                         pull_request,
+                        resolution,
                         current_commit: current,
                     }
                 }
@@ -674,7 +683,8 @@ fn observe_scratch_git(
 }
 
 /// Asks Git, in each worktree of `paths`, whether local `HEAD` is behind the
-/// head of its one merged pull request. Only observations that every other
+/// head of its proving pull request: the one merged pull request, or else the
+/// newest closed one. Only observations that every other
 /// check passes and that are blocked by a head mismatch pay for it.
 /// `observations` holds one entry per path, in the same order. A failed check
 /// fails that worktree.
@@ -938,42 +948,50 @@ fn describe(outcome: &PruneOutcome) -> (Role, String) {
     match outcome {
         PruneOutcome::Prunable {
             pull_request,
+            resolution,
             proof,
         } => (
             Role::Prunable,
             format!(
-                "merged pull request #{pull_request}; {}would remove worktree and branch",
+                "{} pull request #{pull_request}; {}would remove worktree and branch",
+                resolution.label(),
                 proof_clause(*proof, "is")
             ),
         ),
         PruneOutcome::Pruned {
             pull_request,
+            resolution,
             proof,
             ..
         } => (
             Role::Pruned,
             format!(
-                "merged pull request #{pull_request}; {}removed worktree and branch",
+                "{} pull request #{pull_request}; {}removed worktree and branch",
+                resolution.label(),
                 proof_clause(*proof, "was")
             ),
         ),
         PruneOutcome::BranchKept {
             pull_request,
+            resolution,
             current_commit: Some(current),
         } => (
             Role::Kept,
             format!(
-                "merged pull request #{pull_request}; removed worktree; kept branch because it moved to {}",
+                "{} pull request #{pull_request}; removed worktree; kept branch because it moved to {}",
+                resolution.label(),
                 short(current)
             ),
         ),
         PruneOutcome::BranchKept {
             pull_request,
+            resolution,
             current_commit: None,
         } => (
             Role::Kept,
             format!(
-                "merged pull request #{pull_request}; removed worktree; branch was already deleted"
+                "{} pull request #{pull_request}; removed worktree; branch was already deleted",
+                resolution.label()
             ),
         ),
         PruneOutcome::Stale => (
@@ -1067,34 +1085,34 @@ fn describe_skip(reason: &PruneSkipReason) -> (Role, String) {
         PruneSkipReason::OpenPullRequest(number) => {
             (Role::Skipped, format!("pull request #{number} is open"))
         }
-        PruneSkipReason::ClosedPullRequest(number) => (
-            Role::Skipped,
-            format!("pull request #{number} was closed without merging"),
-        ),
         PruneSkipReason::AmbiguousPullRequests(count) => (
             Role::Blocked,
             format!("{count} merged pull requests; expected exactly one"),
         ),
         PruneSkipReason::HeadMismatch {
             pull_request,
+            resolution,
             pull_request_head,
             local_head,
         } => (
             Role::Blocked,
             format!(
-                "merged pull request #{pull_request} has head {}, not local HEAD {}",
+                "{} pull request #{pull_request} has head {}, not local HEAD {}",
+                resolution.label(),
                 short(pull_request_head),
                 short(local_head)
             ),
         ),
-        PruneSkipReason::MergedHeadMissing {
+        PruneSkipReason::PullRequestHeadMissing {
             pull_request,
+            resolution,
             pull_request_head,
             local_head,
         } => (
             Role::Blocked,
             format!(
-                "merged pull request #{pull_request} has head {}, not local HEAD {}; its head commit is not in the local repository",
+                "{} pull request #{pull_request} has head {}, not local HEAD {}; its head commit is not in the local repository",
+                resolution.label(),
                 short(pull_request_head),
                 short(local_head)
             ),
