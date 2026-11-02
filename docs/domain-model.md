@@ -36,7 +36,7 @@ _Code_: `ScratchObservation`
 _Avoid_: busy worktree, open worktree
 _Code_: `PruneSkipReason::InUse`
 
-**Prunable worktree:** A scratch worktree whose folder exists and that is unlocked, not in use, clean apart from ignored files, and free of any Git operation. It is attached to a branch that is not the main branch or a stand-in branch. That branch has no open pull request and exactly one merged pull request. The head commit of that pull request equals local `HEAD`, or local `HEAD` is a strict ancestor of it. A merged head commit that is missing from the local repository proves nothing, so the worktree stays blocked. Only `bu prune` removes it, together with its local branch. The branch delete pins local `HEAD`, never the merged head.
+**Prunable worktree:** A scratch worktree whose folder exists and that is unlocked, not in use, clean apart from ignored files, and free of any Git operation. It is attached to a branch that is not the main branch or a stand-in branch. That branch has no open pull request. Its proving pull request is its one merged pull request or, when nothing merged, its newest closed pull request. The head commit of that pull request equals local `HEAD`, or local `HEAD` is a strict ancestor of it. A head commit that is missing from the local repository proves nothing, so the worktree stays blocked. Only `bu prune` removes it, together with its local branch. The branch delete pins local `HEAD`, never the pull-request head.
 _Avoid_: merged worktree, stale worktree
 _Code_: `ScratchDecision::Prunable`, `HeadProof`
 

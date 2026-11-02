@@ -161,7 +161,7 @@ printf '}}}
 
 /// Fake `gh`: every branch has one merged pull request at its local tip unless a
 /// branch-specific case below says otherwise. `refs/pr-heads/<branch>`, when it
-/// exists, replaces the local tip as that merged head. Also installs a fake
+/// exists, replaces the local tip as that merged or closed head. Also installs a fake
 /// `lsof` that reports no processes, so tests never depend on the host's
 /// process table.
 fn fake_gh(temporary: &TempDir) -> PathBuf {
@@ -181,8 +181,10 @@ case "$head" in
     printf '[]\n' ;;
   scratch/open)
     printf '[{{"number":7,"state":"OPEN","mergedAt":null,"headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "$oid" ;;
-  scratch/closed)
-    printf '[{{"number":8,"state":"CLOSED","mergedAt":null,"headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "$oid" ;;
+  scratch/closed|scratch/closed-behind)
+    printf '[{{"number":8,"state":"CLOSED","mergedAt":null,"headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "${{pr_head:-$oid}}" ;;
+  scratch/closed-twice)
+    printf '[{{"number":9,"state":"CLOSED","mergedAt":null,"headRefName":"%s","headRefOid":"{MISMATCHED_HEAD}"}},{{"number":8,"state":"CLOSED","mergedAt":null,"headRefName":"%s","headRefOid":"%s"}}]\n' "$head" "$head" "$oid" ;;
   scratch/mismatch)
     printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headRefName":"%s","headRefOid":"{MISMATCHED_HEAD}"}}]\n' "$head" ;;
   scratch/ambiguous)
@@ -417,7 +419,7 @@ fn prune_skips_every_unproven_scratch_worktree_and_leaves_it_untouched() {
         ],
     );
     let open = add_scratch(&repository, "open", "scratch/open");
-    let closed = add_scratch(&repository, "closed", "scratch/closed");
+    let closed_twice = add_scratch(&repository, "closed-twice", "scratch/closed-twice");
     let mismatch = add_scratch(&repository, "mismatch", "scratch/mismatch");
     let ambiguous = add_scratch(&repository, "ambiguous", "scratch/ambiguous");
     let none = add_scratch(&repository, "none", "scratch/none");
@@ -439,7 +441,7 @@ fn prune_skips_every_unproven_scratch_worktree_and_leaves_it_untouched() {
         "▎ blocked  scratch-detached detached HEAD is detached\n",
         "▎ skipped  scratch-protected main main is the configured main branch\n",
         "▎ skipped  scratch-open scratch/open pull request #7 is open\n",
-        "▎ skipped  scratch-closed scratch/closed pull request #8 was closed without merging\n",
+        "▎ blocked  scratch-closed-twice scratch/closed-twice closed pull request #9 has head 0000000, not local HEAD ",
         "▎ blocked  scratch-mismatch scratch/mismatch merged pull request #42 has head 0000000, not local HEAD ",
         "▎ blocked  scratch-ambiguous scratch/ambiguous 2 merged pull requests; expected exactly one\n",
         "▎ skipped  scratch-none scratch/none no pull request found\n",
@@ -458,7 +460,7 @@ fn prune_skips_every_unproven_scratch_worktree_and_leaves_it_untouched() {
     )));
     assert!(
         stdout.contains(
-            "\nChecked 12 scratch worktrees\n0 pruned, 0 cleaned, 0 kept, 7 blocked, 5 skipped, 0 failed\n"
+            "\nChecked 12 scratch worktrees\n0 pruned, 0 cleaned, 0 kept, 8 blocked, 4 skipped, 0 failed\n"
         ),
         "{stdout}"
     );
@@ -470,7 +472,7 @@ fn prune_skips_every_unproven_scratch_worktree_and_leaves_it_untouched() {
         &detached,
         &protected,
         &open,
-        &closed,
+        &closed_twice,
         &mismatch,
         &ambiguous,
         &none,
@@ -776,7 +778,7 @@ fn prune_dry_run_looks_up_every_branch_in_one_github_call() {
     for row in [
         "▎ prunable scratch-done scratch/done merged pull request #42; would remove worktree and branch\n",
         "▎ skipped  scratch-open scratch/open pull request #7 is open\n",
-        "▎ skipped  scratch-closed scratch/closed pull request #8 was closed without merging\n",
+        "▎ prunable scratch-closed scratch/closed closed pull request #8; would remove worktree and branch\n",
         "▎ blocked  scratch-dirty scratch/dirty dirty worktree (1 file)\n",
     ] {
         assert!(stdout.contains(row), "missing {row:?} in:\n{stdout}");
@@ -2077,4 +2079,67 @@ printf '[{{"number":42,"state":"MERGED","mergedAt":"2026-07-28T00:00:00Z","headR
     assert_eq!(object_store_files(&repository), objects_before);
     assert!(scratch.exists());
     assert!(ref_exists(&repository, "refs/heads/scratch/partial"));
+}
+
+/// Bug caught: a pull request closed without merging blocked its worktree
+/// forever, so abandoned and superseded attempts piled up. The newest closed
+/// pull request is the proof, because GitHub keeps its head as
+/// `refs/pull/<N>/head`. An older closed head that matches proves nothing.
+#[test]
+fn prune_removes_a_worktree_whose_head_the_newest_closed_pull_request_holds() {
+    let (temporary, repository) = prune_fixture();
+    let exact = add_scratch(&repository, "closed", "scratch/closed");
+    let behind = add_scratch(&repository, "closed-behind", "scratch/closed-behind");
+    let closed_head = commit_on(&repository, "scratch/closed-behind", "review fix");
+    set_merged_head(&repository, "scratch/closed-behind", &closed_head);
+    let twice = add_scratch(&repository, "closed-twice", "scratch/closed-twice");
+    let twice_local = rev_parse(&repository, "scratch/closed-twice");
+    let config = write_repository_config(&temporary, &repository);
+    let fake_bin = fake_gh(&temporary);
+    let worktrees_before = registered_worktrees(&repository);
+    let refs_before = git(&repository, &["show-ref"]);
+
+    let dry_run = prune(&config, &fake_bin, &["--dry-run"]);
+
+    assert_success(&dry_run);
+    let dry_stdout = stdout(&dry_run);
+    for expected in [
+        "▎ prunable scratch-closed scratch/closed closed pull request #8; would remove worktree and branch\n",
+        "▎ prunable scratch-closed-behind scratch/closed-behind closed pull request #8; local HEAD is 1 commit behind its head; would remove worktree and branch\n",
+        "\nChecked 3 scratch worktrees\n2 prunable, 0 stale, 1 blocked, 0 skipped, 0 failed\nDry run: no changes were made\n",
+    ] {
+        assert!(
+            dry_stdout.contains(expected),
+            "missing {expected:?} in\n{dry_stdout}"
+        );
+    }
+    assert_eq!(registered_worktrees(&repository), worktrees_before);
+    assert_eq!(git(&repository, &["show-ref"]), refs_before);
+
+    let output = prune(&config, &fake_bin, &[]);
+
+    assert_success(&output);
+    let stdout = stdout(&output);
+    let twice_row = format!(
+        "▎ blocked  scratch-closed-twice scratch/closed-twice closed pull request #9 has head 0000000, not local HEAD {}; its head commit is not in the local repository\n",
+        &twice_local[..7]
+    );
+    for expected in [
+        "▎ pruned   scratch-closed scratch/closed closed pull request #8; removed worktree and branch\n",
+        "▎ pruned   scratch-closed-behind scratch/closed-behind closed pull request #8; local HEAD was 1 commit behind its head; removed worktree and branch\n",
+        twice_row.as_str(),
+        "\nChecked 3 scratch worktrees\n2 pruned, 0 cleaned, 0 kept, 1 blocked, 0 skipped, 0 failed\n",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in\n{stdout}"
+        );
+    }
+    assert!(!exact.exists());
+    assert!(!behind.exists());
+    assert!(!ref_exists(&repository, "refs/heads/scratch/closed"));
+    assert!(!ref_exists(&repository, "refs/heads/scratch/closed-behind"));
+    assert!(commit_exists(&repository, &closed_head));
+    assert!(twice.exists());
+    assert_eq!(rev_parse(&repository, "scratch/closed-twice"), twice_local);
 }

@@ -120,6 +120,22 @@ impl PullRequest {
     }
 }
 
+/// How the pull request that proves a scratch worktree ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PullRequestResolution {
+    Merged,
+    Closed,
+}
+
+impl PullRequestResolution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum BenchDecision {
     Eligible {
@@ -240,12 +256,12 @@ pub struct ScratchObservation {
     /// Ignored, untracked files that match a `prune.keep` pattern.
     pub kept_ignored: Vec<PathBuf>,
     pub pull_requests: PullRequestState,
-    /// How local `HEAD` relates to the head of the one merged pull request,
+    /// How local `HEAD` relates to the head of the proving pull request,
     /// asked only when the two commits differ.
     pub head_ancestry: HeadAncestry,
 }
 
-/// What Git proved about local `HEAD` and a different merged head commit.
+/// What Git proved about local `HEAD` and a different pull-request head commit.
 #[derive(Clone, Copy, Debug)]
 pub enum HeadAncestry {
     /// Not asked. Never counts as proof.
@@ -253,16 +269,16 @@ pub enum HeadAncestry {
     /// Local `HEAD` is a strict ancestor of the merged head, this many commits
     /// behind it.
     Behind(u64),
-    /// Local `HEAD` has commits that the merged head lacks.
+    /// Local `HEAD` has commits that the pull-request head lacks.
     NotAncestor,
-    /// The merged head commit is not in the local object store.
+    /// The pull-request head commit is not in the local object store.
     MissingHead,
 }
 
 /// The proof that made a scratch worktree prunable.
 #[derive(Clone, Copy, Debug)]
 pub enum HeadProof {
-    /// The merged head commit equals local `HEAD`.
+    /// The pull-request head commit equals local `HEAD`.
     Exact,
     /// Local `HEAD` is a strict ancestor of the merged head, this many commits
     /// behind it.
@@ -273,9 +289,10 @@ pub enum HeadProof {
 pub enum ScratchDecision {
     Prunable {
         branch: String,
-        /// Local `HEAD`, which the branch delete pins. Never the merged head.
+        /// Local `HEAD`, which the branch delete pins. Never the pull-request head.
         commit: String,
         pull_request: u64,
+        resolution: PullRequestResolution,
         proof: HeadProof,
     },
     Skip(PruneSkipReason),
@@ -308,17 +325,18 @@ pub enum PruneSkipReason {
     PullRequestNotChecked,
     NoPullRequest,
     OpenPullRequest(u64),
-    ClosedPullRequest(u64),
     AmbiguousPullRequests(usize),
     HeadMismatch {
         pull_request: u64,
+        resolution: PullRequestResolution,
         pull_request_head: String,
         local_head: String,
     },
-    /// The merged head differs from local `HEAD` and is not in the local
+    /// The pull-request head differs from local `HEAD` and is not in the local
     /// object store, so its ancestry is unknown. `bu` never fetches it.
-    MergedHeadMissing {
+    PullRequestHeadMissing {
         pull_request: u64,
+        resolution: PullRequestResolution,
         pull_request_head: String,
         local_head: String,
     },
@@ -374,42 +392,55 @@ pub fn decide_scratch(
         .iter()
         .filter(|pull_request| pull_request.is_merged())
         .collect();
-    match merged.as_slice() {
-        [] => ScratchDecision::Skip(match pull_requests.first() {
-            Some(closed) => PruneSkipReason::ClosedPullRequest(closed.number),
-            None => PruneSkipReason::NoPullRequest,
-        }),
-        [pull_request] if pull_request.head_commit == *commit => ScratchDecision::Prunable {
+    let (pull_request, resolution) = match merged.as_slice() {
+        // Numbers grow with creation, so the highest is the newest attempt.
+        [] => match pull_requests
+            .iter()
+            .max_by_key(|pull_request| pull_request.number)
+        {
+            Some(closed) => (closed, PullRequestResolution::Closed),
+            None => return ScratchDecision::Skip(PruneSkipReason::NoPullRequest),
+        },
+        [pull_request] => (*pull_request, PullRequestResolution::Merged),
+        many => {
+            return ScratchDecision::Skip(PruneSkipReason::AmbiguousPullRequests(many.len()));
+        }
+    };
+    if pull_request.head_commit == *commit {
+        return ScratchDecision::Prunable {
             branch: name.clone(),
             commit: commit.clone(),
             pull_request: pull_request.number,
+            resolution,
             proof: HeadProof::Exact,
+        };
+    }
+    match observation.head_ancestry {
+        // A distance of 0 means Git resolved both names to one commit,
+        // which is not a strict ancestor.
+        HeadAncestry::Behind(commits) if commits > 0 => ScratchDecision::Prunable {
+            branch: name.clone(),
+            commit: commit.clone(),
+            pull_request: pull_request.number,
+            resolution,
+            proof: HeadProof::Behind(commits),
         },
-        [pull_request] => match observation.head_ancestry {
-            // A distance of 0 means Git resolved both names to one commit,
-            // which is not a strict ancestor.
-            HeadAncestry::Behind(commits) if commits > 0 => ScratchDecision::Prunable {
-                branch: name.clone(),
-                commit: commit.clone(),
+        HeadAncestry::MissingHead => {
+            ScratchDecision::Skip(PruneSkipReason::PullRequestHeadMissing {
                 pull_request: pull_request.number,
-                proof: HeadProof::Behind(commits),
-            },
-            HeadAncestry::MissingHead => {
-                ScratchDecision::Skip(PruneSkipReason::MergedHeadMissing {
-                    pull_request: pull_request.number,
-                    pull_request_head: pull_request.head_commit.clone(),
-                    local_head: commit.clone(),
-                })
-            }
-            HeadAncestry::NotChecked | HeadAncestry::NotAncestor | HeadAncestry::Behind(_) => {
-                ScratchDecision::Skip(PruneSkipReason::HeadMismatch {
-                    pull_request: pull_request.number,
-                    pull_request_head: pull_request.head_commit.clone(),
-                    local_head: commit.clone(),
-                })
-            }
-        },
-        many => ScratchDecision::Skip(PruneSkipReason::AmbiguousPullRequests(many.len())),
+                resolution,
+                pull_request_head: pull_request.head_commit.clone(),
+                local_head: commit.clone(),
+            })
+        }
+        HeadAncestry::NotChecked | HeadAncestry::NotAncestor | HeadAncestry::Behind(_) => {
+            ScratchDecision::Skip(PruneSkipReason::HeadMismatch {
+                pull_request: pull_request.number,
+                resolution,
+                pull_request_head: pull_request.head_commit.clone(),
+                local_head: commit.clone(),
+            })
+        }
     }
 }
 
@@ -417,8 +448,8 @@ pub fn decide_scratch(
 mod scratch_tests {
     use super::{
         CurrentBranch, HeadAncestry, HeadProof, OperationState, ProtectedBranches, PruneSkipReason,
-        PullRequest, PullRequestLifecycle, PullRequestState, ScratchDecision, ScratchObservation,
-        WorktreeState, decide_scratch,
+        PullRequest, PullRequestLifecycle, PullRequestResolution, PullRequestState,
+        ScratchDecision, ScratchObservation, WorktreeState, decide_scratch,
     };
 
     fn protected() -> ProtectedBranches {
@@ -482,6 +513,63 @@ mod scratch_tests {
         assert!(matches!(
             decision,
             ScratchDecision::Skip(PruneSkipReason::OpenPullRequest(2))
+        ));
+    }
+
+    #[test]
+    fn the_newest_closed_pull_request_is_the_proof_in_any_answer_order() {
+        for pull_requests in [
+            vec![
+                pull_request(3, PullRequestLifecycle::ClosedUnmerged, "tip"),
+                pull_request(5, PullRequestLifecycle::ClosedUnmerged, "newer"),
+            ],
+            vec![
+                pull_request(5, PullRequestLifecycle::ClosedUnmerged, "newer"),
+                pull_request(3, PullRequestLifecycle::ClosedUnmerged, "tip"),
+            ],
+        ] {
+            assert!(matches!(
+                decide_scratch(&observation(pull_requests), &protected()),
+                ScratchDecision::Skip(PruneSkipReason::HeadMismatch {
+                    pull_request: 5,
+                    resolution: PullRequestResolution::Closed,
+                    ..
+                })
+            ));
+        }
+
+        assert!(matches!(
+            decide_scratch(
+                &observation(vec![
+                    pull_request(3, PullRequestLifecycle::ClosedUnmerged, "old"),
+                    pull_request(5, PullRequestLifecycle::ClosedUnmerged, "tip"),
+                ]),
+                &protected(),
+            ),
+            ScratchDecision::Prunable {
+                pull_request: 5,
+                resolution: PullRequestResolution::Closed,
+                proof: HeadProof::Exact,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_merge_outranks_a_newer_closed_attempt() {
+        assert!(matches!(
+            decide_scratch(
+                &observation(vec![
+                    pull_request(2, PullRequestLifecycle::Merged, "tip"),
+                    pull_request(4, PullRequestLifecycle::ClosedUnmerged, "other"),
+                ]),
+                &protected(),
+            ),
+            ScratchDecision::Prunable {
+                pull_request: 2,
+                resolution: PullRequestResolution::Merged,
+                ..
+            }
         ));
     }
 
